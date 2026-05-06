@@ -375,7 +375,7 @@ jisr is different in two ways:
 The two are complementary. Composer is the right choice when you need
 fine-grained streaming control or are building into the BOE ecosystem.
 jisr is the right choice when you want to write a filter the same way you
-write a `net/http` handler.
+write any other Go middleware.
 
 ---
 

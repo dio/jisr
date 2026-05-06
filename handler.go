@@ -1,10 +1,6 @@
-// Package jisr provides a net/http-style API for writing Envoy dynamic module
-// filters in Go.
-//
-// Instead of implementing the raw HttpFilter interface (event-loop thread
-// discipline, status enums, UnsafeEnvoyBuffer management), you register a
-// [HandlerFunc] and write ordinary blocking code. jisr bridges the goroutine
-// onto Envoy's worker thread internally.
+// Package jisr provides a Go middleware API for writing Envoy dynamic module
+// filters. Register a [HandlerFunc] and write ordinary blocking code — jisr
+// bridges the goroutine onto Envoy's worker thread internally.
 //
 // # Quick start
 //

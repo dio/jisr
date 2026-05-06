@@ -1,6 +1,6 @@
 # jisr
 
-**jisr** (جسر — Arabic for "bridge") is a net/http-style handler abstraction for writing [Envoy dynamic module](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/dynamic_modules) filters in Go.
+**jisr** (جسر — Arabic for "bridge") is a Go middleware API for writing [Envoy dynamic module](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/dynamic_modules) filters.
 
 Instead of implementing the raw `HttpFilter` interface with status enums, event-loop thread discipline, and `UnsafeEnvoyBuffer` management, you register a `HandlerFunc` and write blocking code. jisr handles the goroutine bridge internally.
 
