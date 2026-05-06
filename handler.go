@@ -171,6 +171,18 @@ type ResponseWriter interface {
 }
 
 // HandlerFunc is a function that handles an Envoy HTTP filter event.
+//
+// Typical usage:
+//
+//	func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    r.SkipBody() // header-only — skip to avoid blocking on body channel
+//	    if r.Header.Get("x-api-key") == "" {
+//	        w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
+//	        return
+//	    }
+//	    w.SetRequestHeader("x-user-id", "alice")
+//	    // return without Send → request forwarded upstream
+//	}
 type HandlerFunc func(ctx context.Context, w ResponseWriter, r *Request)
 
 // Middleware wraps a HandlerFunc, returning a new HandlerFunc.

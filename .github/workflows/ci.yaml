@@ -10,7 +10,7 @@ env:
   ENVOY_VERSION: "1.37.1"
 
 jobs:
-  # ── Unit tests for the jisr library itself ────────────────────────────────
+  # ── Unit tests: root module + sub-packages ─────────────────────────────────
   test:
     name: unit tests
     runs-on: ubuntu-latest
@@ -20,8 +20,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: CGO_ENABLED=1 go build ./...
-      - run: go test ./...
+      - name: build jisr
+        run: CGO_ENABLED=1 go build ./...
+      - name: test jisr
+        run: go test ./...
+      - name: test jisr/server
+        run: cd server && go test ./...
+      - name: test jisr/buffer
+        run: cd buffer && go test ./...
 
   # ── Build + e2e for examples/hello ───────────────────────────────────────
   e2e:
