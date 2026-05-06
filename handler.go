@@ -13,6 +13,7 @@
 //	}
 //
 //	func myHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    r.Log(jisr.LogInfo, "handling request: %s", r.Header.Get(":path"))
 //	    if r.Header.Get("x-api-key") == "" {
 //	        w.SendError(http.StatusUnauthorized, `{"error":"missing api key"}`)
 //	        return
@@ -62,6 +63,18 @@ import (
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
 )
 
+// Log levels that map directly to Envoy's log levels.
+// Use these with [Request.Log] so messages appear in Envoy's log output
+// with the correct level, worker thread ID, and timestamp.
+const (
+	LogTrace    = shared.LogLevelTrace
+	LogDebug    = shared.LogLevelDebug
+	LogInfo     = shared.LogLevelInfo
+	LogWarn     = shared.LogLevelWarn
+	LogError    = shared.LogLevelError
+	LogCritical = shared.LogLevelCritical
+)
+
 // Header is a copy of the request headers in Go-owned memory.
 // Mutations queue up and are applied on ContinueRequest.
 // Same underlying type as http.Header for familiarity.
@@ -81,6 +94,23 @@ type Request struct {
 
 	// FilterName is the Envoy filter name this request matched.
 	FilterName string
+
+	// log is wired up by the filter bridge after the goroutine starts.
+	// It schedules the log call back onto the Envoy worker thread so
+	// messages appear in Envoy's own log output with the correct metadata.
+	log func(level shared.LogLevel, format string, args ...any)
+}
+
+// Log emits a message to Envoy's logger at the given level.
+// Messages appear in Envoy's log output with the worker thread ID,
+// component tag, and timestamp — identical to logs from Envoy itself.
+//
+// Use the jisr log level constants: [LogTrace], [LogDebug], [LogInfo],
+// [LogWarn], [LogError], [LogCritical].
+//
+//	r.Log(jisr.LogInfo, "auth ok for key=%s", apiKey)
+func (r *Request) Log(level shared.LogLevel, format string, args ...any) {
+	r.log(level, format, args...)
 }
 
 // ResponseWriter is the interface through which a Handler sends a response

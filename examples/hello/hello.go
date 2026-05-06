@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 
 	"github.com/dio/jisr"
@@ -16,7 +15,7 @@ func init() {
 
 func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-		log.Printf("hello: %s %s", r.Header.Get(":method"), r.Header.Get(":path"))
+		r.Log(jisr.LogInfo, "[%s] %s %s", r.FilterName, r.Header.Get(":method"), r.Header.Get(":path"))
 		next(ctx, w, r)
 	}
 }
@@ -29,6 +28,7 @@ func helloHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 func echoHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		r.Log(jisr.LogError, "echoHandler: failed to read body: %v", err)
 		w.SendErrorBytes(http.StatusInternalServerError, jsonErr("failed to read body"))
 		return
 	}

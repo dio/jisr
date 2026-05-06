@@ -137,6 +137,11 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 		Header:     h,
 		Body:       f.bodyReader,
 		FilterName: f.name,
+		log: func(level shared.LogLevel, format string, args ...any) {
+			// handle.Log is thread-safe in the Envoy SDK — it routes
+			// through Envoy's spdlog which is designed for multi-thread use.
+			f.handle.Log(level, format, args...)
+		},
 	}
 	f.rw = &responseWriterImpl{filter: f}
 

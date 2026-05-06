@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ENVOY_VERSION: "1.37.1"
+
+jobs:
+  # ── Unit tests for the jisr library itself ────────────────────────────────
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: CGO_ENABLED=1 go build ./...
+      - run: go test ./...
+
+  # ── Build + e2e for examples/hello ───────────────────────────────────────
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: cache envoy
+        id: cache-envoy
+        uses: actions/cache@v4
+        with:
+          path: .envoy
+          key: envoy-${{ env.ENVOY_VERSION }}-linux-amd64
+
+      - name: download envoy
+        if: steps.cache-envoy.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .envoy
+          curl -fsSL \
+            "https://archive.tetratelabs.io/envoy/download/v${ENVOY_VERSION}/envoy-v${ENVOY_VERSION}-linux-amd64.tar.xz" \
+            -o /tmp/envoy.tar.xz
+          tar -xJf /tmp/envoy.tar.xz --strip-components=2 -C .envoy
+          chmod +x .envoy/envoy
+
+      - name: build libhello.so
+        run: make -C examples/hello build
+
+      - name: run e2e tests
+        env:
+          ENVOY_BIN: ${{ github.workspace }}/.envoy/envoy
+          JISR_SKIP_BUILD: "1"
+        run: |
+          cd e2e && go test -v -tags e2e -timeout 60s ./...
