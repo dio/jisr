@@ -2,7 +2,7 @@ GOCMD := CGO_ENABLED=1 go
 
 # All Go modules in this repo.
 MODULES := . server buffer prof e2e \
-           examples/hello examples/decoder examples/sse-tap \
+           examples/hello examples/auth examples/decoder examples/sse-tap \
            examples/multi-actor examples/ws-proxy examples/spa
 
 .PHONY: all build test tidy tidy-check examples e2e clean

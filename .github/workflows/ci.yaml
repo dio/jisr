@@ -29,7 +29,7 @@ jobs:
         run: cd examples/spa && make ui
       - name: verify go.mod tidy
         run: |
-          for d in . server buffer prof e2e examples/hello examples/decoder examples/sse-tap examples/multi-actor examples/ws-proxy examples/spa; do
+          for d in . server buffer prof e2e examples/hello examples/auth examples/decoder examples/sse-tap examples/multi-actor examples/ws-proxy examples/spa; do
             (cd "$d" && GOWORK=off go mod tidy)
           done
           git diff --exit-code -- '**go.mod' '**go.sum'
@@ -45,6 +45,8 @@ jobs:
         run: cd prof && go test -race ./...
       - name: test examples/decoder
         run: cd examples/decoder && go test -race ./...
+      - name: test examples/auth
+        run: cd examples/auth && go test -race ./...
       - name: test examples/sse-tap
         run: cd examples/sse-tap && go test -race ./...
       - name: test examples/multi-actor

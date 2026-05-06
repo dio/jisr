@@ -4,6 +4,7 @@ use (
 	.
 	./buffer
 	./e2e
+	./examples/auth
 	./examples/decoder
 	./examples/hello
 	./examples/multi-actor

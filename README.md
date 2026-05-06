@@ -194,6 +194,10 @@ The factory pattern vs `RegisterWithConfig`:
 | Multiple configs | shared vars (not safe) | each gets its own struct |
 | Testability | requires global state reset | construct struct directly in tests |
 
+See [examples/auth](examples/auth) for a complete runnable example: a configurable
+API key auth filter where two Envoy listeners can use the same `.so` with different
+allowed key sets, each getting its own independent `*AuthFilter` instance.
+
 ## Envoy-native metrics and routing
 
 Use `RegisterWithConfig` (request-only) or `RegisterWithConfigAndResponse` (full lifecycle) to define Envoy metrics at `.so` load time and use them per-request:
