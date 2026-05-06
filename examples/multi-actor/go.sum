@@ -1,9 +1,5 @@
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dio/jisr v0.7.0 h1:CHiK9ESRwL6mqnAtznuqFyGy4htpOaN34bKWCznhNt8=
-github.com/dio/jisr v0.7.0/go.mod h1:3MnC7HDgyUCL3vfC8nLUNeGelsaFphJu6ShzB+SNuiY=
-github.com/dio/jisr v0.8.0 h1:Q06gQVbH4UvDRHbvwHF36WCQWcTxgpS0NPkqJdKzyfs=
-github.com/dio/jisr v0.8.0/go.mod h1:5awJKg2wlXz5P3QR1qQwh3VoWPdX1s88dk38UAYIko8=
 github.com/dio/jisr v0.9.0 h1:wknfdYz0ls18XIoYe++y8lIpxMXebcEYVjo4bAXo/Pg=
 github.com/dio/jisr v0.9.0/go.mod h1:5awJKg2wlXz5P3QR1qQwh3VoWPdX1s88dk38UAYIko8=
 github.com/dio/jisr/server v0.4.0 h1:O3f0LZhOPDOVSt3voSU7NAZanJ5MQfreNKQTrsKHKf0=
