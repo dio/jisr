@@ -1,40 +1,43 @@
 // Package wsproxy demonstrates the embedded WebSocket proxy pattern using
-// jisr/server.
+// jisr/server, with a complete implementation for the OpenAI Realtime API
+// at /v1/responses.
 //
-// # The Problem
+// # Protocol: OpenAI Realtime WebSocket (/v1/responses)
 //
-// Envoy's HTTP filter chain cannot inspect WebSocket frames. After a 101
-// Switching Protocols response, the connection becomes raw TCP — OnRequestBody
-// and OnResponseBody are never called for WS frames.
+// The client sends one message to start a response:
 //
-// # The Solution
+//	{"type":"response.create","model":"gpt-4o-mini","input":[...],"max_output_tokens":N}
 //
-// Run a net/http server inside the .so. Envoy routes WebSocket upgrade requests
-// to a local STATIC cluster pointing at this server. The server accepts the WS
-// upgrade from the client, dials the real upstream, and pumps frames
-// bidirectionally — tapping every frame for inspection.
+// The server streams events back:
+//
+//	{"type":"response.created", ...}
+//	{"type":"response.output_text.delta", "delta":"Hi"}   // text chunks
+//	{"type":"response.output_text.done",  ...}
+//	{"type":"response.completed", "response":{"usage":{"input_tokens":N,"output_tokens":M}}}
+//
+// The WSProxy taps every frame:
+//   - Client → Upstream: extracts model name from response.create
+//   - Upstream → Client: extracts token usage from response.completed
 //
 // # Architecture
 //
-//	Client ──WS──► Envoy ──► ws-proxy cluster (127.0.0.1:<port>)
-//	                               │
-//	                        WSProxy.ServeHTTP
-//	                               │
-//	                        upstream dial (wss://...)
-//	                               │
-//	              ◄──frames──► upstream provider
-//
-// The filter factory (rawFactory) starts the WSProxy once per filter config
-// and stores the stop function — called from OnDestroy when Envoy reloads.
-//
-// A companion jisr.Register filter can share the same .so for normal HTTP
-// traffic (auth, header rewriting, etc.).
+//	Client ──WS──► Envoy (port 10000, upgrade route)
+//	                  │  ──► ws-proxy-local cluster (127.0.0.1:<random>)
+//	                  │              │
+//	                  │      WSProxy.ServeHTTP
+//	                  │              │  ──► wss://api.openai.com/v1/responses
+//	                  │              │      Authorization: Bearer $OPENAI_API_KEY
+//	                  │
+//	Normal HTTP ──► upstream cluster (TLS + ws-auth upstream filter)
 package wsproxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/coder/websocket"
@@ -49,24 +52,6 @@ func init() {
 	jisr.RegisterRaw(ExtensionName, &rawConfigFactory{})
 }
 
-// Config is parsed from the filter_config JSON.
-type Config struct {
-	// UpstreamURL is the base wss:// URL of the upstream provider.
-	// Example: "wss://api.openai.com"
-	UpstreamURL string `json:"upstream_url"`
-
-	// AuthHeader is the HTTP header name to inject into the upstream dial.
-	// Example: "authorization"
-	AuthHeader string `json:"auth_header"`
-
-	// AuthValue is the value of the auth header. Supports ${ENV_VAR} expansion.
-	AuthValue string `json:"auth_value"`
-
-	// ShutdownTimeout is how long to wait for active WS sessions to finish
-	// on Envoy reload/shutdown. Defaults to 5s.
-	ShutdownTimeout string `json:"shutdown_timeout"`
-}
-
 // --- rawConfigFactory ---
 
 type rawConfigFactory struct {
@@ -77,12 +62,8 @@ func (f *rawConfigFactory) Create(
 	handle shared.HttpFilterConfigHandle,
 	raw []byte,
 ) (shared.HttpFilterFactory, error) {
-	cfg := Config{
-		UpstreamURL: "wss://api.openai.com",
-		AuthHeader:  "authorization",
-	}
-	// In production, parse raw JSON into cfg here.
-	_ = raw
+	cfg := parseConfig(raw)
+	proxy := newWSProxy(cfg)
 
 	timeout := 5 * time.Second
 	if cfg.ShutdownTimeout != "" {
@@ -91,21 +72,13 @@ func (f *rawConfigFactory) Create(
 		}
 	}
 
-	proxy := &WSProxy{
-		upstreamURL: cfg.UpstreamURL,
-		authHeader:  cfg.AuthHeader,
-		authValue:   cfg.AuthValue,
-	}
-
 	srv, stop, err := server.New(proxy, timeout)
 	if err != nil {
-		handle.Log(shared.LogLevelError, "ws-proxy: failed to start embedded server: %v", err)
+		handle.Log(shared.LogLevelError, "ws-proxy: start failed: %v", err)
 		return nil, fmt.Errorf("ws-proxy: %w", err)
 	}
 
-	handle.Log(shared.LogLevelInfo,
-		"ws-proxy: embedded WS server listening on %s", srv.Addr())
-
+	handle.Log(shared.LogLevelInfo, "ws-proxy: listening on %s", srv.Addr())
 	return &rawFilterFactory{stop: stop}, nil
 }
 
@@ -113,9 +86,6 @@ func (f *rawConfigFactory) CreatePerRoute(_ []byte) (any, error) { return nil, n
 
 // --- rawFilterFactory ---
 
-// rawFilterFactory holds the stop function for the embedded server.
-// It creates a pass-through filter for HTTP traffic — WS upgrades are
-// routed by Envoy to the embedded server's cluster, not through this filter.
 type rawFilterFactory struct {
 	shared.EmptyHttpFilterFactory
 	stop func()
@@ -125,43 +95,75 @@ func (f *rawFilterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFil
 	return &passthroughFilter{}
 }
 
-// OnDestroy stops the embedded WS server when Envoy hot-reloads.
 func (f *rawFilterFactory) OnDestroy() {
 	if f.stop != nil {
 		f.stop()
 	}
 }
 
-// passthroughFilter is a no-op filter for non-WS HTTP traffic.
-// WS traffic never reaches this filter — it goes directly to the embedded server.
-type passthroughFilter struct {
-	shared.EmptyHttpFilter
+type passthroughFilter struct{ shared.EmptyHttpFilter }
+
+// --- Config ---
+
+// Config is the JSON config for the ws-proxy filter.
+type Config struct {
+	// UpstreamURL is the upstream wss:// base URL.
+	// Default: "wss://api.openai.com"
+	UpstreamURL string `json:"upstream_url"`
+
+	// AuthHeader is the HTTP header name to inject when dialing upstream.
+	// Default: "authorization"
+	AuthHeader string `json:"auth_header"`
+
+	// AuthValue is the header value. Supports ${ENV_VAR} expansion.
+	// Default: "Bearer ${OPENAI_API_KEY}"
+	AuthValue string `json:"auth_value"`
+
+	// ShutdownTimeout for graceful shutdown. Default: "5s".
+	ShutdownTimeout string `json:"shutdown_timeout"`
+}
+
+func parseConfig(raw []byte) Config {
+	cfg := Config{
+		UpstreamURL: "wss://api.openai.com",
+		AuthHeader:  "authorization",
+		AuthValue:   "Bearer ${OPENAI_API_KEY}",
+	}
+	if len(raw) > 0 {
+		json.Unmarshal(raw, &cfg) //nolint:errcheck
+	}
+	return cfg
+}
+
+func newWSProxy(cfg Config) *WSProxy {
+	return &WSProxy{
+		upstreamURL: cfg.UpstreamURL,
+		authHeader:  cfg.AuthHeader,
+		authValue:   resolveEnv(cfg.AuthValue),
+		log:         slog.Default(),
+	}
 }
 
 // --- WSProxy ---
 
-// WSProxy is an http.Handler that accepts WebSocket upgrades from Envoy,
-// dials the upstream provider, and pumps frames bidirectionally.
-//
-// OnClientFrame and OnUpstreamFrame are optional hooks called for every frame
-// in each direction. Set them before the server starts to inspect or meter frames.
+// WSProxy is an http.Handler that proxies WebSocket connections to an upstream
+// provider, tapping frames for model extraction and token counting.
 type WSProxy struct {
 	upstreamURL string
 	authHeader  string
 	authValue   string
 	log         *slog.Logger
 
-	// OnClientFrame is called for each frame sent by the downstream client.
-	// It runs in the pump goroutine — keep it fast and non-blocking.
+	// OnClientFrame is called for each text frame the client sends.
+	// Runs in the pump goroutine — must be fast and non-blocking.
 	OnClientFrame func(websocket.MessageType, []byte)
 
-	// OnUpstreamFrame is called for each frame received from the upstream.
-	// It runs in the pump goroutine — keep it fast and non-blocking.
+	// OnUpstreamFrame is called for each text frame received from upstream.
+	// Runs in the pump goroutine — must be fast and non-blocking.
 	OnUpstreamFrame func(websocket.MessageType, []byte)
 }
 
-// NewProxy creates a WSProxy. Use this directly in tests or when embedding
-// without the Envoy factory.
+// NewProxy creates a WSProxy for direct use in tests or without the Envoy factory.
 func NewProxy(upstreamURL, authHeader, authValue string) *WSProxy {
 	return &WSProxy{
 		upstreamURL: upstreamURL,
@@ -170,17 +172,16 @@ func NewProxy(upstreamURL, authHeader, authValue string) *WSProxy {
 	}
 }
 
-// ServeHTTP handles an incoming WebSocket upgrade from Envoy.
-// It accepts the upgrade, dials the upstream, and runs the bidirectional pump.
+// ServeHTTP accepts a WebSocket upgrade from Envoy, dials the upstream, and
+// runs the bidirectional frame pump with per-session tapping.
 func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log := slog.Default()
 	if p.log != nil {
 		log = p.log
 	}
 
-	// Accept the WS upgrade from the downstream client.
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // trust Envoy's TLS termination
+		InsecureSkipVerify: true, // Envoy handles downstream TLS
 	})
 	if err != nil {
 		log.Error("ws-proxy: accept failed", "err", err)
@@ -188,29 +189,27 @@ func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.CloseNow()
 
-	// Dial the upstream provider with auth injected.
 	upstreamHeader := http.Header{}
 	if p.authHeader != "" && p.authValue != "" {
 		upstreamHeader.Set(p.authHeader, p.authValue)
 	}
 
 	ctx := r.Context()
-	upstreamConn, _, err := websocket.Dial(ctx, p.upstreamURL+r.URL.Path, &websocket.DialOptions{
+	upstreamURL := p.upstreamURL + r.URL.Path
+	upstreamConn, _, err := websocket.Dial(ctx, upstreamURL, &websocket.DialOptions{
 		HTTPHeader: upstreamHeader,
 	})
 	if err != nil {
-		log.Error("ws-proxy: upstream dial failed", "url", p.upstreamURL+r.URL.Path, "err", err)
+		log.Error("ws-proxy: upstream dial failed", "url", upstreamURL, "err", err)
 		clientConn.Close(websocket.StatusInternalError, "upstream unavailable")
 		return
 	}
 	defer upstreamConn.CloseNow()
 
-	log.Info("ws-proxy: session started", "path", r.URL.Path)
+	tap := NewSessionTap()
 	start := time.Now()
+	log.Info("ws-proxy: session started", "path", r.URL.Path)
 
-	// Bidirectional frame pump.
-	// Two goroutines run concurrently — one per direction.
-	// The first to error (client disconnect or upstream close) signals the other via errc.
 	errc := make(chan error, 2)
 
 	// Client → Upstream
@@ -221,7 +220,12 @@ func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				errc <- fmt.Errorf("client read: %w", err)
 				return
 			}
-			p.onClientFrame(msgType, data)
+			if msgType == websocket.MessageText {
+				tap.FeedClient(data)
+				if p.OnClientFrame != nil {
+					p.OnClientFrame(msgType, data)
+				}
+			}
 			if err := upstreamConn.Write(ctx, msgType, data); err != nil {
 				errc <- fmt.Errorf("upstream write: %w", err)
 				return
@@ -237,7 +241,12 @@ func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				errc <- fmt.Errorf("upstream read: %w", err)
 				return
 			}
-			p.onUpstreamFrame(msgType, data)
+			if msgType == websocket.MessageText {
+				tap.FeedUpstream(data)
+				if p.OnUpstreamFrame != nil {
+					p.OnUpstreamFrame(msgType, data)
+				}
+			}
 			if err := clientConn.Write(ctx, msgType, data); err != nil {
 				errc <- fmt.Errorf("client write: %w", err)
 				return
@@ -245,25 +254,106 @@ func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Wait for either direction to close.
 	firstErr := <-errc
+
+	u := tap.Usage()
 	log.Info("ws-proxy: session ended",
 		"path", r.URL.Path,
+		"model", tap.Model(),
+		"input_tokens", u.InputTokens,
+		"output_tokens", u.OutputTokens,
 		"duration", time.Since(start).Round(time.Millisecond),
 		"reason", firstErr,
 	)
 }
 
-// onClientFrame is called for every frame the client sends upstream.
-func (p *WSProxy) onClientFrame(msgType websocket.MessageType, data []byte) {
-	if p.OnClientFrame != nil {
-		p.OnClientFrame(msgType, data)
+// --- sessionTap ---
+
+// SessionTap extracts the model name and token usage from OpenAI Realtime frames.
+// It is created fresh for each WebSocket session.
+// Exported for unit testing.
+type SessionTap struct {
+	model  string
+	input  uint32
+	output uint32
+}
+
+// NewSessionTap creates a new SessionTap.
+func NewSessionTap() *SessionTap { return &SessionTap{} }
+
+// FeedClient taps the response.create frame (first client message) to extract
+// the model name. All subsequent client frames are ignored after model is known.
+//
+// OpenAI Realtime client frame format:
+//
+//	{"type":"response.create","model":"gpt-4o-mini","input":[...],"max_output_tokens":20}
+func (t *SessionTap) FeedClient(data []byte) {
+	if t.model != "" {
+		return
+	}
+	if !bytes.Contains(data, []byte("response.create")) {
+		return
+	}
+	var f struct {
+		Type  string `json:"type"`
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(data, &f) == nil && f.Type == "response.create" && f.Model != "" {
+		t.model = f.Model
 	}
 }
 
-// onUpstreamFrame is called for every frame the upstream sends to the client.
-func (p *WSProxy) onUpstreamFrame(msgType websocket.MessageType, data []byte) {
-	if p.OnUpstreamFrame != nil {
-		p.OnUpstreamFrame(msgType, data)
+// FeedUpstream taps the response.completed frame (final server event) to extract
+// token usage. All other upstream frames are ignored.
+//
+// OpenAI Realtime server frame format:
+//
+//	{"type":"response.completed","response":{"usage":{"input_tokens":N,"output_tokens":M}}}
+func (t *SessionTap) FeedUpstream(data []byte) {
+	if !bytes.Contains(data, []byte("response.completed")) {
+		return
 	}
+	var f struct {
+		Type     string `json:"type"`
+		Response struct {
+			Usage struct {
+				InputTokens  uint32 `json:"input_tokens"`
+				OutputTokens uint32 `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(data, &f) == nil && f.Type == "response.completed" {
+		t.input = f.Response.Usage.InputTokens
+		t.output = f.Response.Usage.OutputTokens
+	}
+}
+
+// Model returns the model name extracted from response.create, or "" if not yet seen.
+func (t *SessionTap) Model() string { return t.model }
+
+// TokenUsage holds the token counts from the completed response.
+type TokenUsage struct {
+	InputTokens  uint32
+	OutputTokens uint32
+}
+
+// Usage returns the token usage extracted from response.completed.
+func (t *SessionTap) Usage() TokenUsage {
+	return TokenUsage{InputTokens: t.input, OutputTokens: t.output}
+}
+
+// ResolveEnv expands ${ENV_VAR} references in v using os.Expand.
+// Returns v unchanged if the variable is unset.
+func ResolveEnv(v string) string {
+	return resolveEnv(v)
+}
+
+func resolveEnv(v string) string {
+	// Use Expand but preserve ${VAR} when the variable is unset.
+	return os.Expand(v, func(key string) string {
+		if val := os.Getenv(key); val != "" {
+			return val
+		}
+		return "${" + key + "}" // leave unexpanded
+	})
 }
