@@ -194,6 +194,14 @@ type ResponseWriter interface {
 	// ContinueRequest. value must be string, int64, float64, or bool.
 	// Has no effect if Send/SendBytes/Stream was called.
 	SetMetadata(namespace, key string, value any)
+
+	// SetUpstreamResponseHeader queues a mutation to the upstream response
+	// headers, applied before ContinueResponse. Only valid from a ResponseFunc.
+	SetUpstreamResponseHeader(key, value string)
+
+	// ReplaceBody replaces the upstream response body. Only valid in
+	// ResponseModeBuffer. The caller must also set content-length accordingly.
+	ReplaceBody(body []byte)
 }
 
 // ResponseMode declares how a ResponseFunc processes the upstream response body.

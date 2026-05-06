@@ -513,6 +513,8 @@ func (m *mockWriter) SetRequestHeader(k, v string) {
 	m.headers[k] = v
 }
 func (m *mockWriter) SetResponseHeader(_, _ string)                                  {}
+func (m *mockWriter) SetUpstreamResponseHeader(_, _ string)                           {}
+func (m *mockWriter) ReplaceBody(_ []byte)                                            {}
 func (m *mockWriter) SetMetadata(ns, k string, v any) {
 	m.mu.Lock(); defer m.mu.Unlock()
 	m.meta[ns+"/"+k] = v

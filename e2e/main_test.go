@@ -3,12 +3,13 @@
 package e2e
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -16,9 +17,11 @@ import (
 )
 
 const (
-	envoyAddr     = "http://localhost:10000"
-	envoyEchoAddr = "http://localhost:10001"
-	adminAddr     = "http://localhost:9901"
+	envoyAddr      = "http://localhost:10000" // hello filter
+	envoyEchoAddr  = "http://localhost:10001" // hello-echo direct response
+	envoyStampAddr = "http://localhost:10002" // resp-stamp (Passthrough)
+	envoyTapAddr   = "http://localhost:10003" // resp-tap (Observe)
+	adminAddr      = "http://localhost:9901"
 )
 
 var (
@@ -88,9 +91,17 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// startEchoBackend binds on a random free port and returns the port number.
+// startEchoBackend starts the backend HTTP server on a random port.
+// Endpoints:
+//
+//	/          — JSON echo of path, method, headers
+//	/body      — returns a fixed JSON body (useful for byte-count tests)
+//	/slow      — writes headers + one chunk, then abruptly closes (upstream disconnect)
+//	/chunked   — sends body in known chunks, then closes cleanly
 func startEchoBackend() int {
 	mux := http.NewServeMux()
+
+	// Default echo handler.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		headers := make(map[string]string, len(r.Header))
 		for k, v := range r.Header {
@@ -102,6 +113,46 @@ func startEchoBackend() int {
 			"method":  r.Method,
 			"headers": headers,
 		})
+	})
+
+	// /body — fixed body, useful for byte-count assertions.
+	mux.HandleFunc("/body", func(w http.ResponseWriter, r *http.Request) {
+		payload := `{"message":"hello from backend","ok":true}`
+		w.Header().Set("content-type", "application/json")
+		w.Header().Set("content-length", fmt.Sprintf("%d", len(payload)))
+		fmt.Fprint(w, payload)
+	})
+
+	// /chunked — sends body in two chunks then closes cleanly.
+	mux.HandleFunc("/chunked", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/plain")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		fmt.Fprint(w, "chunk-one ")
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprint(w, "chunk-two")
+		flusher.Flush()
+	})
+
+	// /slow — abruptly closes the TCP connection mid-response (upstream disconnect).
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "no hijacker", 500)
+			return
+		}
+		conn, buf, _ := hj.Hijack()
+		// Write a valid HTTP response header + one partial chunk.
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n")
+		buf.WriteString("5\r\nhello\r\n") // valid first chunk
+		buf.Flush()
+		// Abruptly close without the final 0-length terminating chunk.
+		// Envoy will detect the incomplete response and call OnStreamComplete.
+		conn.Close()
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -183,6 +234,64 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: blackhole }
 
+    # Port 10002 — resp-stamp filter: Passthrough, stamps x-jisr-processed on response.
+    - name: resp-stamp
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10002 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: resp_stamp
+                http_filters:
+                  - name: resp-stamp
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: resp-stamp
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: stamp
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+
+    # Port 10003 — resp-tap filter: Observe, stamps x-jisr-body-bytes on response.
+    - name: resp-tap
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10003 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: resp_tap
+                http_filters:
+                  - name: resp-tap
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: resp-tap
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: tap
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+
   clusters:
     - name: backend
       type: STATIC
@@ -229,4 +338,37 @@ func waitReady(timeout time.Duration) bool {
 		time.Sleep(300 * time.Millisecond)
 	}
 	return false
+}
+
+// envoyHealthy checks that Envoy is still serving via the admin endpoint.
+func envoyHealthy(t *testing.T) bool {
+	t.Helper()
+	resp, err := http.Get(adminAddr + "/ready")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// dialAndSendRequest opens a raw TCP connection to addr, sends a minimal
+// HTTP/1.1 GET request, and returns the connection (caller owns close).
+func dialAndSendRequest(addr, path string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// readStatusLine reads just the first line of an HTTP response.
+func readStatusLine(conn net.Conn) (string, error) {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(conn)
+	return r.ReadString('\n')
 }
