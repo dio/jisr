@@ -50,6 +50,13 @@ func main() {}
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 ```
 
+## Docs
+
+| Document | Contents |
+|----------|----------|
+| [RATIONALE.md](RATIONALE.md) | Why jisr exists; design decisions behind the goroutine model, response modes, zero-copy body, metrics, ClearRouteCache, and escape hatches |
+| [CONSTRAINTS.md](CONSTRAINTS.md) | What works, what doesn't, and why — tested against Envoy 1.37.1. Response header mutation, attribute support, body rules, metrics, SDK naming, go.work |
+
 ## Modifying the upstream response
 
 Use `RegisterWithResponse` with `ResponseModeBuffer` to read, modify, or replace what the upstream sent before the client receives it.
@@ -269,8 +276,6 @@ Each request spawns one goroutine. `OnRequestHeaders` copies headers into Go mem
 For response phase filters, the same goroutine blocks on a channel until `OnResponseHeaders` arrives, then runs the `ResponseFunc`. Passthrough and Buffer modes schedule `ContinueResponse` from the goroutine; Observe mode lets headers flow immediately (`HeadersStatusContinue`) and taps the body as it streams.
 
 See [examples/hello](examples/hello) for a runnable request-phase example and [examples/decoder](examples/decoder) for a full request+response lifecycle example.
-
-For a complete reference of what works, what doesn't, and why — including response header mutation timing, attribute support, metrics rules, and SDK constraints — see [CONSTRAINTS.md](CONSTRAINTS.md).
 
 ## License
 
