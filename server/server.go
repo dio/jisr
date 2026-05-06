@@ -178,7 +178,6 @@ func (g *Group) Start() {
 	errc := make(chan struct{}, len(g.actors))
 
 	for _, a := range g.actors {
-		a := a
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()

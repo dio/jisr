@@ -127,9 +127,7 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	// Use http.CanonicalHeaderKey so r.Header.Get works with any casing.
 	h := make(http.Header)
 	for _, kv := range headers.GetAll() {
-		k := http.CanonicalHeaderKey(kv[0].ToString())
-		v := kv[1].ToString()
-		h[k] = append(h[k], v)
+		h.Add(http.CanonicalHeaderKey(kv[0].ToString()), kv[1].ToString())
 	}
 
 	// Set up body pipeline.

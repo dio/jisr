@@ -58,6 +58,7 @@ package jisr
 import (
 	"context"
 	"io"
+	"maps"
 	"net/http"
 
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
@@ -283,8 +284,6 @@ func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFact
 	for name, fn := range registry {
 		m[name] = &configFactory{name: name, handler: fn}
 	}
-	for name, factory := range rawRegistry {
-		m[name] = factory
-	}
+	maps.Copy(m, rawRegistry)
 	return m
 }
