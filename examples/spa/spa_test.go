@@ -28,6 +28,11 @@ func (m *mockWriter) SendBytes(code int, body []byte)   { m.code = code; m.body 
 func (m *mockWriter) SetRequestHeader(k, v string)      {}
 func (m *mockWriter) SetResponseHeader(k, v string)     { m.headers[k] = v }
 func (m *mockWriter) SetMetadata(_, _ string, _ any)    {}
+func (m *mockWriter) SetUpstreamResponseHeader(_, _ string) {}
+func (m *mockWriter) ReplaceBody(_ []byte)               {}
+func (m *mockWriter) ClearRouteCache()                   {}
+func (m *mockWriter) IncrementCounter(_ jisr.MetricID, _ uint64, _ ...string) {}
+func (m *mockWriter) RecordHistogram(_ jisr.MetricID, _ uint64, _ ...string)  {}
 func (m *mockWriter) Stream(_ context.Context, _ [][2]string) (jisr.StreamWriter, error) {
 	return nil, nil
 }

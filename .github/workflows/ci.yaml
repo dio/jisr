@@ -10,7 +10,7 @@ env:
   ENVOY_VERSION: "1.37.1"
 
 jobs:
-  # ── Unit tests: root module + sub-packages ─────────────────────────────────
+  # ── Unit tests: root module + all sub-packages ─────────────────────────────
   test:
     name: unit tests
     runs-on: ubuntu-latest
@@ -23,13 +23,25 @@ jobs:
       - name: build jisr
         run: CGO_ENABLED=1 go build ./...
       - name: test jisr
-        run: go test ./...
+        run: go test -race ./...
       - name: test jisr/server
-        run: cd server && go test ./...
+        run: cd server && go test -race ./...
       - name: test jisr/buffer
-        run: cd buffer && go test ./...
+        run: cd buffer && go test -race ./...
+      - name: test jisr/prof
+        run: cd prof && go test -race ./...
+      - name: test examples/decoder
+        run: cd examples/decoder && go test -race ./...
+      - name: test examples/sse-tap
+        run: cd examples/sse-tap && go test -race ./...
+      - name: test examples/multi-actor
+        run: cd examples/multi-actor && go test -race ./...
+      - name: test examples/spa
+        run: cd examples/spa && go test -race ./...
+      - name: test examples/ws-proxy
+        run: cd examples/ws-proxy && go test -race ./...
 
-  # ── Build + e2e for examples/hello ───────────────────────────────────────
+  # ── e2e: build all .so files and run against real Envoy ───────────────────
   e2e:
     name: e2e
     runs-on: ubuntu-latest
@@ -61,6 +73,9 @@ jobs:
 
       - name: build libhello.so
         run: make -C examples/hello build
+
+      - name: build libdecoder.so
+        run: make -C examples/decoder build
 
       - name: run e2e tests
         env:
