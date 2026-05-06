@@ -32,8 +32,9 @@
 //
 //	g := server.NewGroup()
 //
-//	ws, err := g.AddHTTP("", wsHandler, 5*time.Second)  // WS proxy server
+//	ln, err := net.Listen("tcp", "127.0.0.1:0")
 //	if err != nil { return nil, err }
+//	ws := g.AddListener(ln, wsHandler, 5*time.Second)  // WS proxy server
 //
 //	g.AddGoroutine(func(ctx context.Context) {       // background metrics
 //	    ticker := time.NewTicker(30 * time.Second)
@@ -82,7 +83,7 @@ type actor struct {
 	stop    func()
 }
 
-// NewGroup creates a new Group. Register actors with Add, AddHTTP, or
+// NewGroup creates a new Group. Register actors with Add, AddListener, or
 // AddGoroutine, then call Start.
 func NewGroup() *Group {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,35 +124,6 @@ func (g *Group) AddGoroutine(fn func(ctx context.Context)) {
 		func() error { fn(ctx); return nil },
 		func() {}, // context cancellation handles the stop signal
 	)
-}
-
-// AddHTTP binds a TCP listener on addr and registers it as an HTTP actor.
-//
-// addr is the TCP address to listen on, e.g. "127.0.0.1:0" (random loopback
-// port), "0.0.0.0:0" (random port on all interfaces), or "127.0.0.1:10001"
-// (fixed port). Use "" for the default: "127.0.0.1:0".
-//
-// handler covers all HTTP-family protocols — pass the appropriate handler:
-//
-//	WebSocket:        your http.Handler that calls websocket.Accept
-//	HTTP/2 cleartext: h2c.NewHandler(mux, &http2.Server{})
-//	gRPC (TLS):       grpc.Server via ServeHTTP — requires HTTP/2 over TLS;
-//	                  for cleartext gRPC use grpc.Serve(ln) with g.Add directly
-//	gRPC + REST:      vanguard.Transcoder or h2c mux dispatching by Content-Type
-//
-// For a listener you've already bound yourself, use [Group.AddListener].
-//
-// timeout controls how long graceful shutdown waits for active connections.
-// Use 0 for the default (5 seconds).
-func (g *Group) AddHTTP(addr string, handler http.Handler, timeout time.Duration) (*Server, error) {
-	if addr == "" {
-		addr = "127.0.0.1:0"
-	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("server.Group.AddHTTP %s: %w", addr, err)
-	}
-	return g.AddListener(ln, handler, timeout), nil
 }
 
 // AddListener registers an already-bound net.Listener as an HTTP actor.
@@ -255,7 +227,7 @@ func (s *Server) Addr() string {
 
 // ── New — single-server convenience ───────────────────────────────────────────
 
-// New starts a single HTTP server on a random free port.
+// New starts a single HTTP server on a random free loopback port.
 // It is a convenience wrapper over [Group] for the common case of one server.
 //
 // Returns the server, a stop function, and any bind error.
@@ -263,11 +235,12 @@ func (s *Server) Addr() string {
 //
 // shutdownTimeout controls graceful shutdown duration. Use 0 for the default (5s).
 func New(handler http.Handler, shutdownTimeout time.Duration) (*Server, func(), error) {
-	g := NewGroup()
-	s, err := g.AddHTTP("", handler, shutdownTimeout)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("server.New: %w", err)
 	}
+	g := NewGroup()
+	s := g.AddListener(ln, handler, shutdownTimeout)
 	g.Start()
 	return s, g.Stop, nil
 }

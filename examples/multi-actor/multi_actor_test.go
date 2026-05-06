@@ -23,10 +23,11 @@ import (
 func TestGroup_HTTPActor_ServesRequests(t *testing.T) {
 	g := server.NewGroup()
 
-	srv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := g.AddListener(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"status":"ok","actors":3}`)
 	}), 0)
-	require.NoError(t, err)
 
 	g.Start()
 	defer g.Stop()
@@ -135,10 +136,11 @@ func TestGroup_AllActors_StopTogether(t *testing.T) {
 	g := server.NewGroup()
 
 	// Actor 1: HTTP
-	httpSrv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	httpSrv := g.AddListener(httpLn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}), 100*time.Millisecond)
-	require.NoError(t, err)
 
 	// Actor 2: background goroutine
 	goroutineStopped := make(chan struct{})
