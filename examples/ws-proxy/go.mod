@@ -4,10 +4,10 @@ go 1.26.2
 
 require (
 	github.com/coder/websocket v1.8.13
-	github.com/dio/jisr v0.6.0
+	github.com/dio/jisr v0.7.0
 	github.com/dio/jisr/server v0.1.0
 	github.com/envoyproxy/envoy/source/extensions/dynamic_modules v0.0.0-20260423231439-f1dd21b16c24
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 )
 
 require (
