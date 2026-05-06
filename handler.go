@@ -1,8 +1,8 @@
 // Package jisr provides a net/http-style API for writing Envoy dynamic module
 // filters in Go.
 //
-// Instead of implementing the raw HttpFilter interface — with event-loop thread
-// discipline, status enums, and UnsafeEnvoyBuffer management — you register a
+// Instead of implementing the raw HttpFilter interface (event-loop thread
+// discipline, status enums, UnsafeEnvoyBuffer management), you register a
 // [HandlerFunc] and write ordinary blocking code. jisr bridges the goroutine
 // onto Envoy's worker thread internally.
 //
@@ -66,12 +66,12 @@ import (
 )
 
 // MetricID is an opaque handle to an Envoy metric defined at config time.
-// It is a re-export of the SDK type — no wrapping, no conversion needed.
+// It is a re-export of the SDK type. No wrapping, no conversion needed.
 type MetricID = shared.MetricID
 
 // ConfigHandle is the handle passed to a ConfigFunc at filter config creation time.
 // Use it to define Envoy metrics and read raw filter config bytes.
-// ConfigHandle methods must only be called from the ConfigFunc — not from handlers.
+// ConfigHandle methods must only be called from the ConfigFunc, not from handlers.
 type ConfigHandle interface {
 	// DefineCounter defines an Envoy counter metric with the given name and tag keys.
 	// Tag keys are declared once; tag values are provided per-increment via IncrementCounter.
@@ -118,11 +118,11 @@ func (c *configHandleImpl) Log(level shared.LogLevel, format string, args ...any
 
 // ConfigFunc is called once when the filter's config factory is created
 // (i.e. when Envoy loads the .so). Use it to define metrics and parse config.
-// Return a non-nil error to abort .so load — Envoy will log the error.
+// Return a non-nil error to abort .so load. Envoy will log the error.
 type ConfigFunc func(h ConfigHandle) error
 
 // Attr re-exports the SDK AttributeID constants for use with r.GetAttr.
-// These map directly to Envoy stream attributes — snapshotted in OnRequestHeaders.
+// These map directly to Envoy stream attributes, snapshotted in OnRequestHeaders.
 const (
 	AttrRequestPath      = shared.AttributeIDRequestPath
 	AttrRequestMethod    = shared.AttributeIDRequestMethod
@@ -169,15 +169,15 @@ type Request struct {
 	// on the worker thread before the handler goroutine is spawned.
 	attrs map[shared.AttributeID]string
 
-	// internal — wired by the filter bridge
+	// internal: wired by the filter bridge
 	log       func(level shared.LogLevel, format string, args ...any)
 	skipBody  func()
 	limitBody func(n int64)
 }
 
 // GetAttr returns a pre-snapshotted Envoy stream attribute by ID.
-// Attributes are read once in OnRequestHeaders on the Envoy worker thread —
-// this method is safe to call from any goroutine with no locking.
+// Attributes are read once in OnRequestHeaders on the Envoy worker thread.
+// Safe to call from any goroutine with no locking.
 //
 // Use the jisr Attr constants: [AttrRequestPath], [AttrRequestMethod], etc.
 //
@@ -194,7 +194,7 @@ func (r *Request) GetAttr(id shared.AttributeID) string {
 // The body channel is closed immediately (any pending io.ReadAll returns EOF)
 // and subsequent OnRequestBody calls forward chunks without buffering.
 //
-// Always call SkipBody when you only need headers — without it, large request
+// Always call SkipBody when you only need headers. Without it, large request
 // bodies will block the Envoy worker thread on the body channel push:
 //
 //	func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
@@ -215,7 +215,7 @@ func (r *Request) SkipBody() {
 // returns EOF and any subsequent request body chunks stream directly to upstream
 // without being copied into Go memory.
 //
-// Use when you only need to inspect the beginning of a large body — for example,
+// Use when you only need to inspect the beginning of a large body. For example,
 // reading a JSON model field from an LLM request while streaming the full body
 // to the upstream provider:
 //
@@ -225,7 +225,7 @@ func (r *Request) SkipBody() {
 //	json.Unmarshal(head, &req)
 //	// remainder of body streams to upstream without Go copies
 //
-// If the body is shorter than n, all bytes are delivered normally —
+// If the body is shorter than n, all bytes are delivered normally.
 // LimitBody has no effect on small bodies.
 //
 // Must be called before reading r.Body. Mutually exclusive with SkipBody.
@@ -237,7 +237,7 @@ func (r *Request) LimitBody(n int64) {
 
 // Log emits a message to Envoy's logger at the given level.
 // Messages appear in Envoy's log output with the worker thread ID,
-// component tag, and timestamp — identical to logs from Envoy itself.
+// component tag, and timestamp. Identical to logs from Envoy itself.
 //
 // Use the jisr log level constants: [LogTrace], [LogDebug], [LogInfo],
 // [LogWarn], [LogError], [LogCritical].
@@ -251,7 +251,7 @@ func (r *Request) Log(level shared.LogLevel, format string, args ...any) {
 // back to the client or mutates the request before forwarding.
 type ResponseWriter interface {
 	// Send sends a local HTTP response to the downstream client with any
-	// status code and terminates the filter chain — the request is NOT
+	// status code and terminates the filter chain. The request is NOT
 	// forwarded upstream.
 	//
 	//	w.Send(http.StatusOK, `{"status":"ok"}`)
@@ -274,7 +274,7 @@ type ResponseWriter interface {
 	// Sends the given response headers immediately and returns a [StreamWriter].
 	// The request is NOT forwarded upstream.
 	//
-	// Call r.SkipBody() before Stream — the body channel must not block the
+	// Call r.SkipBody() before Stream; the body channel must not block the
 	// worker thread while the handler is generating stream output.
 	//
 	// Returns an error if Send/SendBytes was already called, or ctx is done.
@@ -311,7 +311,7 @@ type ResponseWriter interface {
 }
 
 // ResponseMode declares how a ResponseFunc processes the upstream response body.
-// It is set once at registration time and never changes — this lets OnResponseHeaders
+// It is set once at registration time and never changes, so OnResponseHeaders
 // return the correct Envoy status immediately without blocking the worker thread.
 type ResponseMode int32
 
@@ -323,13 +323,13 @@ const (
 
 	// ResponseModeObserve taps the response body as it streams. Chunks are
 	// copied into Go memory and delivered via r.Body, AND forwarded to the
-	// downstream client simultaneously — zero added downstream latency.
+	// downstream client simultaneously, with zero added downstream latency.
 	// Use for SSE token counting, logging, metrics.
 	ResponseModeObserve
 
 	// ResponseModeBuffer accumulates the full response body before the
 	// ResponseFunc returns. r.Body delivers the complete body. The downstream
-	// client waits — adds full response latency.
+	// client waits. Adds full response latency.
 	// Use for response rewriting, JSON transformation, content filtering.
 	ResponseModeBuffer
 )
@@ -339,7 +339,7 @@ const (
 // after ContinueRequest has been called and the upstream response has arrived.
 //
 // The response body mode (Passthrough/Observe/Buffer) is declared once at
-// registration via RegisterWithResponse — not at runtime. This keeps
+// registration via RegisterWithResponse, not at runtime. This keeps
 // OnResponseHeaders non-blocking on the Envoy worker thread.
 type ResponseFunc func(ctx context.Context, w ResponseWriter, r *Response)
 
@@ -353,21 +353,21 @@ type Response struct {
 
 	// Body is a streaming io.Reader for the response body.
 	// Available only in ResponseModeObserve and ResponseModeBuffer.
-	// Nil in ResponseModePassthrough — the body streams through without
+	// Nil in ResponseModePassthrough: the body streams through without
 	// being copied into Go memory.
 	Body io.Reader
 }
 
 // RegisterWithResponse associates both a request HandlerFunc and a response
 // ResponseFunc with an Envoy filter name. Both run in the same goroutine
-// and share the same context — cancellation (client disconnect) propagates to both.
+// and share the same context. Cancellation (client disconnect) propagates to both.
 //
-// mode declares how the response body is handled — set once, never changes.
+// mode declares how the response body is handled (set once, never changes).
 // OnResponseHeaders returns the correct Envoy status without blocking:
 //
-//	ResponseModePassthrough — header-only, body streams through untouched
-//	ResponseModeObserve     — tap body, zero downstream latency
-//	ResponseModeBuffer      — accumulate full body, adds response latency
+//	ResponseModePassthrough: header-only, body streams through untouched
+//	ResponseModeObserve:     tap body, zero downstream latency
+//	ResponseModeBuffer:      accumulate full body, adds response latency
 //
 //	jisr.RegisterWithResponse("my-filter", requestHandler, responseHandler, jisr.ResponseModeObserve)
 func RegisterWithResponse(name string, req HandlerFunc, resp ResponseFunc, mode ResponseMode) {
@@ -384,7 +384,7 @@ func RegisterWithResponse(name string, req HandlerFunc, resp ResponseFunc, mode 
 // Typical usage:
 //
 //	func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-//	    r.SkipBody() // header-only — skip to avoid blocking on body channel
+//	    r.SkipBody() // header-only: skip to avoid blocking on body channel
 //	    if r.Header.Get("x-api-key") == "" {
 //	        w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
 //	        return
@@ -432,7 +432,7 @@ var respModeRegistry = map[string]ResponseMode{}
 var rawRegistry = map[string]shared.HttpFilterConfigFactory{}
 
 // RegisterWithConfig associates a ConfigFunc and a HandlerFunc with an Envoy filter name.
-// The ConfigFunc runs once when the .so is loaded — use it to define Envoy metrics
+// The ConfigFunc runs once when the .so is loaded. Use it to define Envoy metrics
 // and parse filter config. The HandlerFunc runs per-request.
 //
 //	var requestsTotal jisr.MetricID
@@ -475,7 +475,7 @@ func Register(name string, fn HandlerFunc) {
 }
 
 // RegisterRaw registers a raw [shared.HttpFilterConfigFactory] for filters that
-// need direct SDK access — raw OnRequestBody callbacks, response phase hooks,
+// need direct SDK access: raw OnRequestBody callbacks, response phase hooks,
 // or anything jisr's HandlerFunc model cannot express.
 //
 // Use when a single .so needs both jisr-managed and raw filters:
@@ -492,7 +492,7 @@ func RegisterRaw(name string, factory shared.HttpFilterConfigFactory) {
 }
 
 // Unregister removes a previously registered filter by name.
-// Intended for use in tests — production code should not unregister filters.
+// Intended for use in tests. Production code should not unregister filters.
 func Unregister(name string) {
 	delete(registry, name)
 	delete(configRegistry, name)
@@ -509,7 +509,7 @@ func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFact
 	for name, fn := range registry {
 		m[name] = &configFactory{
 			name:        name,
-			configFn:    configRegistry[name], // nil for plain Register — handled in Create
+			configFn:    configRegistry[name], // nil for plain Register, handled in Create
 			handler:     fn,
 			respHandler: respRegistry[name],
 			respMode:    respModeRegistry[name],

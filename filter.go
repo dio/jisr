@@ -14,7 +14,7 @@ import (
 
 type configFactory struct {
 	name        string
-	configFn    ConfigFunc // optional — nil for Register (no setup)
+	configFn    ConfigFunc // optional: nil for plain Register
 	handler     HandlerFunc
 	respHandler ResponseFunc
 	respMode    ResponseMode
@@ -46,7 +46,7 @@ type filterFactory struct {
 	name        string
 	handler     HandlerFunc
 	respHandler ResponseFunc
-	respMode    ResponseMode // fixed at registration — read-only after construction
+	respMode    ResponseMode // fixed at registration, read-only after construction
 }
 
 func (f *filterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFilter {
@@ -69,7 +69,7 @@ type handlerFilter struct {
 	handle      shared.HttpFilterHandle
 	handler     HandlerFunc
 	respHandler ResponseFunc
-	respMode    ResponseMode // fixed — safe to read from any goroutine without sync
+	respMode    ResponseMode // fixed: safe to read from any goroutine without sync
 	name        string
 
 	// set in OnRequestHeaders, used across callbacks
@@ -81,8 +81,8 @@ type handlerFilter struct {
 	bodyCh     chan<- []byte
 	bodyReader *bodyReader
 	bodyDone   atomic.Bool // true once endStream seen in OnRequestBody
-	bodySkip   atomic.Bool // true after r.SkipBody() — passthrough mode
-	headDone   atomic.Bool // true after r.LimitBody() threshold reached — stream remainder
+	bodySkip   atomic.Bool // true after r.SkipBody(): passthrough mode
+	headDone   atomic.Bool // true after r.LimitBody() threshold reached: stream remainder
 
 	// response pipeline (non-nil only when respHandler != nil)
 	respHeadersCh  chan http.Header // OnResponseHeaders pushes here; goroutine blocks on it
@@ -103,8 +103,8 @@ type responseWriterImpl struct {
 	headerMuts  []headerMutation
 	respHeaders [][2]string
 	metaMuts    []metaMutation
-	clearRoute  bool             // queued ClearRouteCache — applied before ContinueRequest
-	metricMuts  []metricMutation // queued metric increments — applied before ContinueRequest
+	clearRoute  bool             // queued ClearRouteCache, applied before ContinueRequest
+	metricMuts  []metricMutation // queued metric increments, applied before ContinueRequest
 
 	// response-phase mutations (applied before ContinueResponse)
 	respHeaderMuts []headerMutation
@@ -182,7 +182,7 @@ func (w *responseWriterImpl) ReplaceBody(body []byte) {
 
 // OnRequestHeaders is called by Envoy on the worker thread when request headers arrive.
 func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream bool) shared.HeadersStatus {
-	// Capture scheduler BEFORE spawning goroutine — must be on worker thread.
+	// Capture scheduler BEFORE spawning goroutine. Must be on worker thread.
 	f.scheduler = f.handle.GetScheduler()
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 
@@ -199,20 +199,20 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	f.bodyCh = bodyCh
 
 	if endStream {
-		// No body coming — close channel immediately so io.ReadAll returns empty.
+		// No body coming: close channel immediately so io.ReadAll returns empty.
 		close(bodyCh)
 		f.bodyDone.Store(true)
 	}
 
 	// Set up response pipeline if a ResponseFunc is registered.
 	if f.respHandler != nil {
-		f.respHeadersCh = make(chan http.Header, 1) // buffered — OnResponseHeaders never blocks
+		f.respHeadersCh = make(chan http.Header, 1) // buffered: OnResponseHeaders never blocks
 		var respBodyCh chan<- []byte
 		f.respBodyReader, respBodyCh = newBodyReader()
 		f.respBodyCh = respBodyCh
 	}
 
-	// Snapshot common Envoy stream attributes — read here on the worker thread
+	// Snapshot common Envoy stream attributes: read here on the worker thread
 	// so handlers can call r.GetAttr() from any goroutine without locking.
 	attrIDs := []shared.AttributeID{
 		shared.AttributeIDRequestPath,
@@ -242,7 +242,7 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 			f.handle.Log(level, format, args...)
 		},
 		skipBody: func() {
-			// CAS prevents double-close. Also check bodyDone — if endStream
+			// CAS prevents double-close. Also check bodyDone: if endStream
 			// was true on headers, bodyCh is already closed.
 			if !f.bodyDone.Load() && f.bodySkip.CompareAndSwap(false, true) {
 				close(bodyCh)
@@ -301,7 +301,7 @@ func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) sh
 }
 
 // OnResponseHeaders is called by Envoy when upstream response headers arrive.
-// It never blocks the worker thread — mode is known at construction time.
+// It never blocks the worker thread. Mode is known at construction time.
 func (f *handlerFilter) OnResponseHeaders(headers shared.HeaderMap, endStream bool) shared.HeadersStatus {
 	if f.respHandler == nil {
 		return shared.HeadersStatusContinue
@@ -321,13 +321,13 @@ func (f *handlerFilter) OnResponseHeaders(headers shared.HeaderMap, endStream bo
 		}
 	}
 
-	// Push to goroutine — buffered channel, never blocks.
+	// Push to goroutine: buffered channel, never blocks.
 	f.respHeadersCh <- h
 
-	// Mode is fixed at registration — return immediately, no goroutine sync needed.
+	// Mode is fixed at registration; return immediately, no goroutine sync needed.
 	switch f.respMode {
 	case ResponseModeObserve:
-		// Let headers flow to downstream immediately — zero latency for the client.
+		// Let headers flow to downstream immediately, zero latency for the client.
 		// Body chunks will arrive via OnResponseBody returning Continue.
 		return shared.HeadersStatusContinue
 	default: // Passthrough, Buffer
@@ -397,14 +397,14 @@ func (f *handlerFilter) OnStreamComplete() {
 	if f.cancel != nil {
 		f.cancel()
 	}
-	// Close request body channel if open — unblocks a handler goroutine
+	// Close request body channel if open: unblocks a handler goroutine
 	// blocked on r.Body.Read (io.ReadAll) after client disconnect.
 	if f.bodyCh != nil && !f.bodyDone.Load() {
 		if f.bodySkip.CompareAndSwap(false, true) {
 			close(f.bodyCh)
 		}
 	}
-	// Close response body channel if open — unblocks ResponseFunc reading r.Body.
+	// Close response body channel if open: unblocks ResponseFunc reading r.Body.
 	// CAS prevents double-close with OnResponseHeaders/OnResponseBody.
 	if f.respBodyCh != nil {
 		if f.respBodyDone.CompareAndSwap(false, true) {
@@ -458,14 +458,14 @@ func (f *handlerFilter) run(req *Request) {
 	})
 
 	// If the request handler sent a direct response (w.Send/SendBytes), Envoy
-	// will never call OnResponseHeaders — skip the response phase to avoid
+	// will never call OnResponseHeaders; skip the response phase to avoid
 	// parking the goroutine on respHeadersCh forever.
 	if f.rw.responded || f.respHandler == nil {
 		return
 	}
 
 	// Block until response headers arrive from OnResponseHeaders.
-	// This is a goroutine block — the worker thread is not involved.
+	// This is a goroutine block. The worker thread is not involved.
 	var respHeaders http.Header
 	select {
 	case respHeaders = <-f.respHeadersCh:
@@ -492,12 +492,12 @@ func (f *handlerFilter) run(req *Request) {
 	f.respHandler(f.ctx, f.rw, resp)
 
 	// Observe: headers already flowed to downstream (OnResponseHeaders returned
-	// Continue) — no ContinueResponse needed. Just return.
+	// Continue); no ContinueResponse needed. Just return.
 	if f.respMode == ResponseModeObserve {
 		return
 	}
 
-	// Passthrough and Buffer: headers were stopped — schedule ContinueResponse
+	// Passthrough and Buffer: headers were stopped; schedule ContinueResponse
 	// on the worker thread so they flow to downstream now.
 	f.scheduler.Schedule(func() {
 		// Apply response header mutations.

@@ -8,7 +8,7 @@ import (
 )
 
 // StreamWriter is returned by ResponseWriter.Stream. It allows sending a
-// chunked/streaming local response to the downstream client — useful for SSE,
+// chunked/streaming local response to the downstream client. Useful for SSE,
 // newline-delimited JSON, or any protocol that sends data incrementally.
 //
 // All Flush and Close calls are goroutine-safe: they schedule work onto the
@@ -58,7 +58,7 @@ func (sw *streamWriter) Close() error {
 // It schedules SendResponseHeaders onto the Envoy worker thread and blocks
 // until headers are flushed before returning.
 //
-// Call r.SkipBody() before Stream if you don't need the request body —
+// Call r.SkipBody() before Stream if you don't need the request body;
 // otherwise the body channel will block the Envoy worker thread while the
 // handler is generating the stream.
 //

@@ -2,11 +2,11 @@
 //
 // It bundles the standard ops endpoints into a single background server:
 //
-//   - /healthz, /readyz  — liveness/readiness probes (always 200 {"status":"ok"})
-//   - /debug/pprof/*     — Go pprof: goroutines, heap, CPU, trace
-//   - /version           — build info (module path + version)
+//   - /healthz, /readyz  liveness/readiness probes (always 200 {"status":"ok"})
+//   - /debug/pprof/*     Go pprof: goroutines, heap, CPU, trace
+//   - /version           build info (module path + version)
 //
-// All endpoints are served on a dedicated port — never the Envoy admin port.
+// All endpoints are served on a dedicated port, never the Envoy admin port.
 //
 // # Usage
 //
@@ -46,7 +46,7 @@
 //
 // # Quick reference
 //
-//	# Goroutine dump — find leaks
+//	# Goroutine dump (find leaks)
 //	curl http://localhost:6060/debug/pprof/goroutine?debug=2
 //
 //	# 30 s CPU profile
@@ -129,7 +129,7 @@ func Handler() http.Handler {
 		})
 	})
 
-	// ── pprof — explicit handlers, no DefaultServeMux coupling ───────────────
+	// ── pprof: explicit handlers, no DefaultServeMux coupling ─────────────────
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)

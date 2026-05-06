@@ -11,7 +11,7 @@ import "slices"
 
 // Ring is a fixed-size circular buffer that captures the LAST n bytes written.
 // When full, new writes overwrite the oldest data.
-// Zero-allocation after construction — no per-Write allocations.
+// Zero-allocation after construction. No per-Write allocations.
 //
 // Not goroutine-safe. Intended for use within a single filter's OnResponseBody
 // callback sequence (always called on the same Envoy worker thread).
@@ -41,7 +41,7 @@ func (rb *Ring) Write(p []byte) {
 }
 
 // Bytes returns the buffered content in chronological order (oldest first).
-// It linearises the ring in-place using three-reversal rotation — no allocation.
+// It linearises the ring in-place using three-reversal rotation. No allocation.
 // After Bytes(), the ring position is reset to 0 but the data is still valid
 // until the next Write call.
 func (rb *Ring) Bytes() []byte {

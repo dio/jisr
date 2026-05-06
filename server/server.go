@@ -1,7 +1,7 @@
 // Package server provides primitives for running background services inside an
 // Envoy dynamic module (.so).
 //
-// The core abstraction is [Group] — a set of background actors that start
+// The core abstraction is [Group], a set of background actors that start
 // together and stop together when Envoy calls OnDestroy on the filter factory.
 // This generalises the embedded server pattern beyond WebSocket: anything that
 // needs a background goroutine (HTTP server, gRPC server, periodic task, cache
@@ -16,7 +16,7 @@
 // (for any reason), all others are stopped. Call [Group.Stop] from your filter
 // factory's OnDestroy to trigger graceful shutdown.
 //
-// # Minimal usage — single HTTP server
+// # Minimal usage: single HTTP server
 //
 //	// In your raw config factory Create():
 //	srv, stop, err := server.New(myHandler, 0)
@@ -68,7 +68,7 @@ import (
 // Group manages a set of background actors sharing a common lifecycle.
 // All actors start together and stop together when [Group.Stop] is called.
 //
-// Inspired by oklog/run — adapted for .so use: Start is non-blocking, there
+// Inspired by oklog/run, adapted for .so use: Start is non-blocking, there
 // is no signal handling, and panics are recovered rather than crashing the process.
 type Group struct {
 	actors []actor
@@ -93,7 +93,7 @@ func NewGroup() *Group {
 // Add registers a raw actor.
 //
 // execute blocks until the actor finishes. It runs in a background goroutine.
-// stop is called (from another goroutine) to interrupt the actor — it must
+// stop is called (from another goroutine) to interrupt the actor. It must
 // cause execute to return promptly.
 //
 // Panics inside execute are recovered and treated as errors.
@@ -143,7 +143,7 @@ func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.
 
 	srv := &http.Server{
 		Handler:      handler,
-		ReadTimeout:  0, // no timeout — WebSocket/streaming connections are long-lived
+		ReadTimeout:  0, // no timeout: WebSocket/streaming connections are long-lived
 		WriteTimeout: 0,
 	}
 
@@ -159,14 +159,14 @@ func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.
 		func() {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			_ = srv.Shutdown(ctx) // error is context.DeadlineExceeded or ErrServerClosed — both benign at shutdown
+			_ = srv.Shutdown(ctx) // error is context.DeadlineExceeded or ErrServerClosed, both benign at shutdown
 		},
 	)
 
 	return s
 }
 //
-// When any actor finishes (for any reason — normal return, error, or panic),
+// When any actor finishes (for any reason (normal return, error, or panic),
 // Stop is called automatically to interrupt all remaining actors.
 //
 // Call Start exactly once after all actors are registered.
@@ -194,7 +194,7 @@ func (g *Group) Start() {
 }
 
 // Stop interrupts all actors and waits for them to finish gracefully.
-// Safe to call multiple times — only the first call has effect.
+// Safe to call multiple times. Only the first call has effect.
 // Call this from your filter factory's OnDestroy.
 func (g *Group) Stop() {
 	g.once.Do(func() {
@@ -224,7 +224,7 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
-// ── New — single-server convenience ───────────────────────────────────────────
+// ── single-server convenience ──────────────────────────────────────────────────
 
 // New starts a single HTTP server on a random free loopback port.
 // It is a convenience wrapper over [Group] for the common case of one server.

@@ -7,7 +7,7 @@ import "io"
 //
 // Zero-copy design: each chunk received from the channel is held by reference
 // (cur/off). Read() serves bytes directly from the current chunk via a single
-// copy(p, cur[off:]) into the caller's slice — no intermediate buffer.
+// copy(p, cur[off:]) into the caller's slice. No intermediate buffer.
 //
 // Copy count per chunk:
 //   - ToBytes() on the Envoy SDK side:  1 copy (ABI contract, unavoidable)
@@ -46,7 +46,7 @@ func (b *bodyReader) fireLimit() {
 }
 
 // Read implements io.Reader. Blocks until data is available or EOF.
-// Serves bytes directly from the current chunk — no intermediate buffer copy.
+// Serves bytes directly from the current chunk. No intermediate buffer copy.
 func (b *bodyReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -81,7 +81,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 			return n, nil
 		}
 
-		// Current chunk exhausted — release the reference.
+		// Current chunk exhausted: release the reference.
 		b.cur = nil
 		b.off = 0
 
