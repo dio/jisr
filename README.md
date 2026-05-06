@@ -57,6 +57,44 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 | [RATIONALE.md](RATIONALE.md) | Why jisr exists; design decisions behind the goroutine model, response modes, zero-copy body, metrics, ClearRouteCache, and escape hatches |
 | [CONSTRAINTS.md](CONSTRAINTS.md) | What works, what doesn't, and why — tested against Envoy 1.37.1. Response header mutation, attribute support, body rules, metrics, SDK naming, go.work |
 
+## Middleware
+
+`Chain` composes middleware in declaration order. The first middleware is the
+outermost wrapper — it runs first on the way in and last on the way out:
+
+```go
+jisr.Register("my-filter", jisr.Chain(myHandler, logging, auth))
+// execution order: logging → auth → myHandler
+```
+
+A `jisr.Middleware` is a function that wraps a `HandlerFunc`:
+
+```go
+func logging(next jisr.HandlerFunc) jisr.HandlerFunc {
+    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+        r.Log(jisr.LogInfo, "%s %s", r.GetAttr(jisr.AttrRequestMethod), r.GetAttr(jisr.AttrRequestPath))
+        next(ctx, w, r)
+    }
+}
+
+func auth(next jisr.HandlerFunc) jisr.HandlerFunc {
+    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+        r.SkipBody()
+        if r.Header.Get("X-Api-Key") == "" {
+            w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
+            return // short-circuit: next is not called
+        }
+        next(ctx, w, r)
+    }
+}
+```
+
+Middleware runs in the same goroutine as the handler. `context.Context`
+cancellation (client disconnect) propagates through the chain automatically.
+
+Chain is zero-allocation after construction — the composed function is a
+plain closure, no per-request allocation.
+
 ## Modifying the upstream response
 
 Use `RegisterWithResponse` with `ResponseModeBuffer` to read, modify, or replace what the upstream sent before the client receives it.

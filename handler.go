@@ -2,6 +2,11 @@
 // filters. Register a [HandlerFunc] and write ordinary blocking code — jisr
 // bridges the goroutine onto Envoy's worker thread internally.
 //
+// Middleware is composed with [Chain]:
+//
+//	jisr.Register("my-filter", jisr.Chain(myHandler, logging, auth))
+//	// execution order: logging → auth → myHandler
+//
 // # Quick start
 //
 //	func init() {
