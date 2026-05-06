@@ -1,7 +1,6 @@
 package server_test
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"strconv"
@@ -13,17 +12,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEmbedded_ServesRequests(t *testing.T) {
-	ctx, stop := server.Background(func(ctx context.Context) {
-		<-ctx.Done() // keep alive until stopped
-	})
-	defer stop()
-
-	srv, err := server.NewEmbedded(ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestServer_ServesRequests(t *testing.T) {
+	srv, stop, err := server.New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("hello from embedded"))
-	}))
+	}), 0)
 	require.NoError(t, err)
+	defer stop()
+
 	assert.Greater(t, srv.Port(), 0)
 
 	resp, err := http.Get("http://" + srv.Addr() + "/")
@@ -35,14 +31,10 @@ func TestEmbedded_ServesRequests(t *testing.T) {
 	assert.Equal(t, "hello from embedded", string(body))
 }
 
-func TestEmbedded_StopsOnContextCancel(t *testing.T) {
-	ctx, stop := server.Background(func(ctx context.Context) {
-		<-ctx.Done()
-	})
-
-	srv, err := server.NewEmbedded(ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestServer_StopsOnStopCall(t *testing.T) {
+	srv, stop, err := server.New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}))
+	}), 100*time.Millisecond)
 	require.NoError(t, err)
 
 	addr := srv.Addr()
@@ -52,41 +44,38 @@ func TestEmbedded_StopsOnContextCancel(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 
-	// Cancel context → server should shut down.
+	// Stop → graceful shutdown.
 	stop()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	// Should no longer accept connections.
 	_, err = http.Get("http://" + addr + "/")
 	assert.Error(t, err, "expected connection refused after shutdown")
 }
 
-func TestEmbedded_RandomPort(t *testing.T) {
-	ctx, stop := server.Background(func(ctx context.Context) { <-ctx.Done() })
-	defer stop()
-
+func TestServer_RandomPort(t *testing.T) {
 	ports := make(map[int]bool)
+	var stops []func()
+	defer func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}()
+
 	for i := 0; i < 5; i++ {
-		srv, err := server.NewEmbedded(ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		srv, stop, err := server.New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 0)
 		require.NoError(t, err)
+		stops = append(stops, stop)
 		assert.False(t, ports[srv.Port()], "port collision: "+strconv.Itoa(srv.Port()))
 		ports[srv.Port()] = true
 	}
 }
 
-func TestBackground_CancelStopsGoroutine(t *testing.T) {
-	done := make(chan struct{})
-	ctx, stop := server.Background(func(ctx context.Context) {
-		<-ctx.Done()
-		close(done)
-	})
-	_ = ctx
+func TestServer_AddrAndPort_Consistent(t *testing.T) {
+	srv, stop, err := server.New(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 0)
+	require.NoError(t, err)
+	defer stop()
 
-	stop()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("goroutine did not stop after cancel")
-	}
+	assert.Equal(t, "127.0.0.1", srv.Addr()[:9])
+	assert.Contains(t, srv.Addr(), strconv.Itoa(srv.Port()))
 }

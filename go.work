@@ -6,5 +6,6 @@ use (
 	./e2e
 	./examples/hello
 	./examples/sse-tap
+	./examples/ws-proxy
 	./server
 )
