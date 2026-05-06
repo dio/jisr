@@ -21,7 +21,7 @@ import (
 // ExampleHTTP shows a plain HTTP/1.1 server — the baseline.
 //
 //	g := server.NewGroup()
-//	srv, err := g.AddHTTP(myMux, 5*time.Second)
+//	srv, err := g.AddHTTP("", myMux, 5*time.Second)
 //	// srv.Addr() → configure Envoy STATIC cluster
 //
 // Any net/http handler works: ServeMux, gorilla/mux, chi, echo, etc.
@@ -38,7 +38,7 @@ var _ = server.NewGroup // prevent unused import
 //	})
 //
 //	g := server.NewGroup()
-//	srv, err := g.AddHTTP(handler, 0)
+//	srv, err := g.AddHTTP("", handler, 0)
 
 // ExampleH2C shows HTTP/2 cleartext — needed for gRPC without TLS.
 // h2c.NewHandler wraps any http.Handler; the listener stays plain TCP.
@@ -49,7 +49,7 @@ var _ = server.NewGroup // prevent unused import
 //	)
 //
 //	g := server.NewGroup()
-//	srv, err := g.AddHTTP(h2c.NewHandler(myMux, &http2.Server{}), 30*time.Second)
+//	srv, err := g.AddHTTP("", h2c.NewHandler(myMux, &http2.Server{}), 30*time.Second)
 
 // ExampleGRPC_Cleartext shows cleartext gRPC — the common case without TLS.
 // grpc.Server manages its own HTTP/2 transport via Serve(ln).
@@ -84,7 +84,7 @@ var _ = server.NewGroup // prevent unused import
 //	})
 //
 //	g := server.NewGroup()
-//	srv, err := g.AddHTTP(h2c.NewHandler(transcoder, &http2.Server{}), 30*time.Second)
+//	srv, err := g.AddHTTP("", h2c.NewHandler(transcoder, &http2.Server{}), 30*time.Second)
 //	// srv.Addr() → configure Envoy STATIC cluster (h2c-capable)
 
 // ExampleBackgroundTask shows a periodic background goroutine.

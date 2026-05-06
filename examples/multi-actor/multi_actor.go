@@ -57,7 +57,7 @@ func (f *configFactory) Create(
 
 	// Actor 1: HTTP server on a random port.
 	// In production, Envoy's STATIC cluster would point here.
-	httpSrv, err := g.AddHTTP(newStatusHandler(), 5*time.Second)
+	httpSrv, err := g.AddHTTP("", newStatusHandler(), 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("multi-actor: http actor: %w", err)
 	}

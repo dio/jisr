@@ -23,7 +23,7 @@ import (
 func TestGroup_HTTPActor_ServesRequests(t *testing.T) {
 	g := server.NewGroup()
 
-	srv, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"status":"ok","actors":3}`)
 	}), 0)
 	require.NoError(t, err)
@@ -135,7 +135,7 @@ func TestGroup_AllActors_StopTogether(t *testing.T) {
 	g := server.NewGroup()
 
 	// Actor 1: HTTP
-	httpSrv, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpSrv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}), 100*time.Millisecond)
 	require.NoError(t, err)

@@ -32,7 +32,7 @@
 //
 //	g := server.NewGroup()
 //
-//	ws, err := g.AddHTTP(wsHandler, 5*time.Second)  // WS proxy server
+//	ws, err := g.AddHTTP("", wsHandler, 5*time.Second)  // WS proxy server
 //	if err != nil { return nil, err }
 //
 //	g.AddGoroutine(func(ctx context.Context) {       // background metrics
@@ -125,8 +125,11 @@ func (g *Group) AddGoroutine(fn func(ctx context.Context)) {
 	)
 }
 
-// AddHTTP starts a net/http server on a random free port and registers it as
-// an actor. The server is bound immediately — Addr() is valid before Start.
+// AddHTTP binds a TCP listener on addr and registers it as an HTTP actor.
+//
+// addr is the TCP address to listen on, e.g. "127.0.0.1:0" (random loopback
+// port), "0.0.0.0:0" (random port on all interfaces), or "127.0.0.1:10001"
+// (fixed port). Use "" for the default: "127.0.0.1:0".
 //
 // handler covers all HTTP-family protocols — pass the appropriate handler:
 //
@@ -136,52 +139,28 @@ func (g *Group) AddGoroutine(fn func(ctx context.Context)) {
 //	                  for cleartext gRPC use grpc.Serve(ln) with g.Add directly
 //	gRPC + REST:      vanguard.Transcoder or h2c mux dispatching by Content-Type
 //
-// For a fixed port (e.g. declared in Envoy config), use [Group.AddListener].
+// For a listener you've already bound yourself, use [Group.AddListener].
 //
 // timeout controls how long graceful shutdown waits for active connections.
 // Use 0 for the default (5 seconds).
-func (g *Group) AddHTTP(handler http.Handler, timeout time.Duration) (*Server, error) {
-	if timeout == 0 {
-		timeout = 5 * time.Second
+func (g *Group) AddHTTP(addr string, handler http.Handler, timeout time.Duration) (*Server, error) {
+	if addr == "" {
+		addr = "127.0.0.1:0"
 	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("server.Group.AddHTTP: listen: %w", err)
+		return nil, fmt.Errorf("server.Group.AddHTTP %s: %w", addr, err)
 	}
-
-	srv := &http.Server{
-		Handler:      handler,
-		ReadTimeout:  0, // no timeout — WebSocket connections are long-lived
-		WriteTimeout: 0,
-	}
-
-	s := &Server{listener: ln, srv: srv}
-
-	g.Add(
-		func() error {
-			if err := srv.Serve(ln); err != http.ErrServerClosed {
-				return err
-			}
-			return nil
-		},
-		func() {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-		},
-	)
-
-	return s, nil
+	return g.AddListener(ln, handler, timeout), nil
 }
 
-// AddListener registers an existing net.Listener as an HTTP actor.
-// Use when the port must match a pre-declared Envoy STATIC cluster config value
-// rather than binding a random port.
+// AddListener registers an already-bound net.Listener as an HTTP actor.
+// Use when you need full control over the listener (TLS, SO_REUSEPORT, etc.)
+// or when the address is known before the Group is created.
 //
-//	ln, err := net.Listen("tcp", "127.0.0.1:10001") // port declared in envoy.yaml
+//	ln, err := tls.Listen("tcp", "0.0.0.0:443", tlsConfig)
 //	if err != nil { return nil, err }
-//	srv := g.AddListener(ln, myHandler, 5*time.Second)
+//	srv := g.AddListener(ln, myHandler, 30*time.Second)
 //
 // timeout controls how long graceful shutdown waits for active connections.
 // Use 0 for the default (5 seconds).
@@ -192,7 +171,7 @@ func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.
 
 	srv := &http.Server{
 		Handler:      handler,
-		ReadTimeout:  0,
+		ReadTimeout:  0, // no timeout — WebSocket/streaming connections are long-lived
 		WriteTimeout: 0,
 	}
 
@@ -285,7 +264,7 @@ func (s *Server) Addr() string {
 // shutdownTimeout controls graceful shutdown duration. Use 0 for the default (5s).
 func New(handler http.Handler, shutdownTimeout time.Duration) (*Server, func(), error) {
 	g := NewGroup()
-	s, err := g.AddHTTP(handler, shutdownTimeout)
+	s, err := g.AddHTTP("", handler, shutdownTimeout)
 	if err != nil {
 		return nil, nil, err
 	}

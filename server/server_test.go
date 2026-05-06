@@ -76,12 +76,12 @@ func TestNew_RandomPort(t *testing.T) {
 func TestGroup_MultipleHTTPServers(t *testing.T) {
 	g := server.NewGroup()
 
-	srv1, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv1, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "server1")
 	}), 0)
 	require.NoError(t, err)
 
-	srv2, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv2, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "server2")
 	}), 0)
 	require.NoError(t, err)
@@ -108,7 +108,7 @@ func TestGroup_MultipleHTTPServers(t *testing.T) {
 func TestGroup_StopStopsAllActors(t *testing.T) {
 	g := server.NewGroup()
 
-	srv, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 100*time.Millisecond)
+	srv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 100*time.Millisecond)
 	require.NoError(t, err)
 
 	var goroutineDone atomic.Bool
@@ -193,10 +193,31 @@ func TestGroup_ActorPanic_DoesNotCrash(t *testing.T) {
 	})
 }
 
+func TestGroup_AddHTTP_CustomAddr(t *testing.T) {
+	g := server.NewGroup()
+
+	// Bind on all interfaces with a random port.
+	srv, err := g.AddHTTP("0.0.0.0:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}), 0)
+	require.NoError(t, err)
+	g.Start()
+	defer g.Stop()
+
+	assert.Greater(t, srv.Port(), 0)
+	// Addr reflects the actual bound address, not 0.0.0.0:0.
+	assert.Contains(t, srv.Addr(), strconv.Itoa(srv.Port()))
+
+	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(srv.Port()) + "/")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
 func TestGroup_AddrAndPort_ConsistentBeforeStart(t *testing.T) {
 	// Addr() is valid immediately after AddHTTP — before Start().
 	g := server.NewGroup()
-	srv, err := g.AddHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 0)
+	srv, err := g.AddHTTP("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), 0)
 	require.NoError(t, err)
 
 	assert.Greater(t, srv.Port(), 0)
