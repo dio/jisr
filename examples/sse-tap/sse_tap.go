@@ -1,5 +1,5 @@
 // Package ssetap demonstrates how to tap an SSE response stream using
-// jisr.RegisterRaw and jisr/buffer.HeadTail.
+// jisr.RegisterWithConfig and jisr.RegisterWithResponse(ResponseModeObserve).
 //
 // This filter sits on the response path and extracts token usage from
 // streaming LLM responses without buffering the entire body:
@@ -8,23 +8,24 @@
 //     message_start, OpenAI first usage chunk)
 //   - Output tokens appear near the END (message_delta, final usage chunk)
 //
-// The filter uses HeadTail to capture the first 8KB and last 64KB of each
-// response, then scans those regions on stream completion. The middle of
-// a large response is never stored.
+// The filter uses jisr/buffer.HeadTail to capture the first 8KB and last 64KB
+// of each response, then scans those regions on stream completion. The middle
+// of a large response is never stored.
 //
-// Because this needs OnResponseHeaders and OnResponseBody callbacks, it
-// uses jisr.RegisterRaw — the HandlerFunc model only covers the request path.
-// A companion jisr.Register filter (e.g. auth, routing) can share the same .so.
+// ResponseModeObserve delivers body chunks to the handler goroutine while
+// simultaneously forwarding them to the downstream client, so there is zero
+// added latency. This replaces the previous RegisterRaw approach.
 package ssetap
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"strings"
 
 	"github.com/dio/jisr"
 	"github.com/dio/jisr/buffer"
-	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
 )
 
 const ExtensionName = "sse-tap"
@@ -35,109 +36,74 @@ type TokenUsage struct {
 	Output uint32
 }
 
+// Metrics defined once at config time.
+var (
+	inputTokensID  jisr.MetricID
+	outputTokensID jisr.MetricID
+)
+
 func init() {
-	jisr.RegisterRaw(ExtensionName, &configFactory{})
+	jisr.RegisterWithConfigAndResponse(ExtensionName,
+		func(h jisr.ConfigHandle) error {
+			var err error
+			inputTokensID, err = h.DefineCounter("sse_tap_input_tokens")
+			if err != nil {
+				return err
+			}
+			outputTokensID, err = h.DefineCounter("sse_tap_output_tokens")
+			return err
+		},
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+			r.SkipBody()
+			w.SetRequestHeader("x-sse-tap", "1")
+		},
+		tapResponseHandler,
+		jisr.ResponseModeObserve,
+	)
 }
 
-// --- configFactory ---
-
-type configFactory struct {
-	shared.EmptyHttpFilterConfigFactory
-}
-
-func (f *configFactory) Create(
-	handle shared.HttpFilterConfigHandle,
-	_ []byte,
-) (shared.HttpFilterFactory, error) {
-	// Define Envoy metrics once per filter config.
-	inputID, _ := handle.DefineCounter("sse_tap_input_tokens")
-	outputID, _ := handle.DefineCounter("sse_tap_output_tokens")
-	return &filterFactory{inputID: inputID, outputID: outputID}, nil
-}
-
-// --- filterFactory ---
-
-type filterFactory struct {
-	shared.EmptyHttpFilterFactory
-	inputID  shared.MetricID
-	outputID shared.MetricID
-}
-
-func (f *filterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFilter {
-	return &tapFilter{handle: handle, factory: f}
-}
-
-// --- tapFilter: per-request filter ---
-
-type tapFilter struct {
-	shared.EmptyHttpFilter
-
-	handle  shared.HttpFilterHandle
-	factory *filterFactory
-
-	isSSE bool
-	buf   *buffer.HeadTail
-}
-
-// OnResponseHeaders detects text/event-stream and decides whether to tap.
-func (f *tapFilter) OnResponseHeaders(headers shared.HeaderMap, endStream bool) shared.HeadersStatus {
-	if endStream {
-		return shared.HeadersStatusContinue
-	}
-	ct := headers.GetOne("content-type").ToUnsafeString()
-	if strings.Contains(ct, "text/event-stream") {
-		f.isSSE = true
-		// 8KB head captures message_start / early usage.
-		// 64KB tail captures message_delta / final usage chunk.
-		f.buf = buffer.NewHeadTail(8*1024, 64*1024)
-	}
-	// Always continue — never buffer the response, let it stream through.
-	return shared.HeadersStatusContinue
-}
-
-// OnResponseBody feeds each chunk into the ring buffer without stopping the stream.
-func (f *tapFilter) OnResponseBody(body shared.BodyBuffer, endStream bool) shared.BodyStatus {
-	if !f.isSSE || f.buf == nil {
-		return shared.BodyStatusContinue
+// tapResponseHandler taps the SSE body using a HeadTail ring buffer.
+// Runs in the handler goroutine while the body streams to the client.
+func tapResponseHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+	ct := r.Header.Get("Content-Type")
+	if !strings.Contains(ct, "text/event-stream") {
+		// Non-SSE response: drain and ignore.
+		io.Copy(io.Discard, r.Body) //nolint:errcheck
+		return
 	}
 
-	// Feed chunks into head+tail ring. No copy into Go heap — ToUnsafeBytes is
-	// safe here because we consume within the same callback before returning.
-	for _, chunk := range body.GetChunks() {
-		f.buf.Write(chunk.ToUnsafeBytes())
+	// 8KB head captures message_start / early usage.
+	// 64KB tail captures message_delta / final usage chunk.
+	buf := buffer.NewHeadTail(8*1024, 64*1024)
+	chunk := make([]byte, 4096)
+	for {
+		n, err := r.Body.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+		if err != nil {
+			break
+		}
 	}
 
-	if endStream {
-		f.finalize()
-	}
-
-	// Always continue — do not buffer the response body.
-	return shared.BodyStatusContinue
-}
-
-// finalize scans head and tail for token usage and emits metrics.
-func (f *tapFilter) finalize() {
-	u := extractUsage(f.buf.Head(), f.buf.Tail())
+	u := ExtractUsage(buf.Head(), buf.Tail())
 	if u.Input > 0 {
-		f.handle.IncrementCounterValue(f.factory.inputID, uint64(u.Input))
+		w.IncrementCounter(inputTokensID, uint64(u.Input))
 	}
 	if u.Output > 0 {
-		f.handle.IncrementCounterValue(f.factory.outputID, uint64(u.Output))
+		w.IncrementCounter(outputTokensID, uint64(u.Output))
 	}
-	f.handle.SetMetadata("sse_tap", "input_tokens", u.Input)
-	f.handle.SetMetadata("sse_tap", "output_tokens", u.Output)
-	f.handle.Log(shared.LogLevelDebug,
-		"sse-tap: input=%d output=%d", u.Input, u.Output)
+	w.SetMetadata("sse_tap", "input_tokens", u.Input)
+	w.SetMetadata("sse_tap", "output_tokens", u.Output)
 }
 
 // ExtractUsage scans head for input tokens and tail for output tokens.
 // Handles both OpenAI and Anthropic SSE formats.
-// Exported so it can be unit-tested independently of Envoy.
+// Exported for unit testing independently of Envoy.
 func ExtractUsage(head, tail []byte) TokenUsage {
 	return extractUsage(head, tail)
 }
 
-// extractUsage is the internal implementation.
 func extractUsage(head, tail []byte) TokenUsage {
 	var u TokenUsage
 
@@ -213,7 +179,6 @@ func extractUsage(head, tail []byte) TokenUsage {
 	return u
 }
 
-// scanLines calls fn for each complete SSE line. No allocation.
 func scanLines(data []byte, fn func([]byte)) {
 	for {
 		idx := bytes.IndexByte(data, '\n')

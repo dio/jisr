@@ -435,6 +435,8 @@ var rawRegistry = map[string]shared.HttpFilterConfigFactory{}
 // The ConfigFunc runs once when the .so is loaded. Use it to define Envoy metrics
 // and parse filter config. The HandlerFunc runs per-request.
 //
+// For filters that also need a response phase, use [RegisterWithConfigAndResponse].
+//
 //	var requestsTotal jisr.MetricID
 //
 //	func init() {
@@ -459,6 +461,37 @@ func RegisterWithConfig(name string, cfg ConfigFunc, fn HandlerFunc) {
 	}
 	registry[name] = fn
 	configRegistry[name] = cfg
+}
+
+// RegisterWithConfigAndResponse combines config setup, a request HandlerFunc,
+// a response ResponseFunc, and a ResponseMode in a single call.
+// Use this when the filter needs both Envoy metrics and a response phase.
+//
+//	var (
+//	    requestsTotal jisr.MetricID
+//	    ttftMs        jisr.MetricID
+//	)
+//
+//	func init() {
+//	    jisr.RegisterWithConfigAndResponse("zia-decoder",
+//	        func(h jisr.ConfigHandle) error {
+//	            requestsTotal, _ = h.DefineCounter("zia_requests_total", "cluster")
+//	            ttftMs, _        = h.DefineHistogram("zia_ttft_ms", "cluster")
+//	            return nil
+//	        },
+//	        requestHandler,
+//	        responseHandler,
+//	        jisr.ResponseModeObserve,
+//	    )
+//	}
+func RegisterWithConfigAndResponse(name string, cfg ConfigFunc, req HandlerFunc, resp ResponseFunc, mode ResponseMode) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	registry[name] = req
+	configRegistry[name] = cfg
+	respRegistry[name] = resp
+	respModeRegistry[name] = mode
 }
 
 // Register associates a HandlerFunc with an Envoy filter name.
