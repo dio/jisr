@@ -21,14 +21,16 @@ import (
 type fakeHandle struct {
 	jisr.EmptyHttpFilterHandle
 
-	mu             sync.Mutex
-	reqHeaders     *fake.FakeHeaderMap
-	metadata       map[string]any
-	localResp      *localResponse
-	respHeaders    []responseHeaderSent
-	respData       []responseDataSent
-	continued      bool
-	scheduler      *fakeScheduler
+	mu              sync.Mutex
+	reqHeaders      *fake.FakeHeaderMap
+	upstreamRespHdrs *fake.FakeHeaderMap // response headers from upstream
+	metadata        map[string]any
+	localResp       *localResponse
+	respHeaders     []responseHeaderSent
+	respData        []responseDataSent
+	continued       bool
+	continuedResp   bool
+	scheduler       *fakeScheduler
 }
 
 type localResponse struct {
@@ -94,6 +96,21 @@ func (h *fakeHandle) ContinueRequest() {
 	h.continued = true
 }
 
+func (h *fakeHandle) ContinueResponse() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.continuedResp = true
+}
+
+func (h *fakeHandle) ResponseHeaders() shared.HeaderMap {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.upstreamRespHdrs == nil {
+		h.upstreamRespHdrs = fake.NewFakeHeaderMap(nil)
+	}
+	return h.upstreamRespHdrs
+}
+
 func (h *fakeHandle) Log(_ shared.LogLevel, _ string, _ ...any) {}
 
 // fakeScheduler runs scheduled functions synchronously in tests.
@@ -128,6 +145,24 @@ func newHarness(t *testing.T, fn jisr.HandlerFunc) *harness {
 	return &harness{filter: filter, handle: handle}
 }
 
+func newHarnessWithResponse(t *testing.T, fn jisr.HandlerFunc, rfn jisr.ResponseFunc) *harness {
+	t.Helper()
+	name := t.Name()
+	jisr.RegisterWithResponse(name, fn, rfn)
+	t.Cleanup(func() { jisr.Unregister(name) })
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	factory, ok := factories[name]
+	require.True(t, ok)
+
+	filterFactory, err := factory.Create(nil, nil)
+	require.NoError(t, err)
+
+	handle := newFakeHandle(nil)
+	filter := filterFactory.Create(handle)
+	return &harness{filter: filter, handle: handle}
+}
+
 func (h *harness) headers(hdrs map[string][]string, endStream bool) shared.HeadersStatus {
 	h.handle.mu.Lock()
 	h.handle.reqHeaders = fake.NewFakeHeaderMap(hdrs)
@@ -137,6 +172,33 @@ func (h *harness) headers(hdrs map[string][]string, endStream bool) shared.Heade
 
 func (h *harness) body(data []byte, endStream bool) shared.BodyStatus {
 	return h.filter.OnRequestBody(fake.NewFakeBodyBuffer(data), endStream)
+}
+
+func (h *harness) respHeaders(hdrs map[string][]string, endStream bool) shared.HeadersStatus {
+	h.handle.mu.Lock()
+	h.handle.upstreamRespHdrs = fake.NewFakeHeaderMap(hdrs)
+	h.handle.mu.Unlock()
+	return h.filter.OnResponseHeaders(fake.NewFakeHeaderMap(hdrs), endStream)
+}
+
+func (h *harness) respBody(data []byte, endStream bool) shared.BodyStatus {
+	return h.filter.OnResponseBody(fake.NewFakeBodyBuffer(data), endStream)
+}
+
+// waitResponse polls until ContinueResponse is set, with a timeout.
+func (h *harness) waitResponse(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.handle.mu.Lock()
+		done := h.handle.continuedResp
+		h.handle.mu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("response handler did not complete within 3s — possible deadlock")
 }
 
 // wait polls until ContinueRequest or SendLocalResponse is set, with a timeout.
@@ -709,4 +771,196 @@ func TestLimitBody_StatusTransition(t *testing.T) {
 	assert.Equal(t, shared.BodyStatusStopAndBuffer, s2)
 	assert.Equal(t, shared.BodyStatusContinue, s3)
 	assert.Equal(t, shared.BodyStatusContinue, s4)
+}
+
+// ── Response phase ────────────────────────────────────────────────────────────
+
+// TestResponse_Passthrough: default mode — handler sees headers, body streams
+// through without copying into Go memory. ContinueResponse is called.
+func TestResponse_Passthrough(t *testing.T) {
+	var gotStatus int
+	var gotContentType string
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+			r.SkipBody()
+		},
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.Passthrough()
+			gotStatus = r.StatusCode
+			gotContentType = r.Header.Get("Content-Type")
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+
+	// Simulate upstream response headers (eos=true, no body).
+	status := h.respHeaders(map[string][]string{
+		":status":      {"200"},
+		"content-type": {"application/json"},
+	}, true)
+	h.waitResponse(t)
+
+	assert.Equal(t, shared.HeadersStatusStop, status)
+	assert.Equal(t, 200, gotStatus)
+	assert.Equal(t, "application/json", gotContentType)
+	assert.True(t, h.handle.continuedResp)
+}
+
+// TestResponse_Passthrough_BodyNotBuffered: in passthrough mode, response body
+// chunks return Continue immediately — never enter Go memory.
+func TestResponse_Passthrough_BodyNotBuffered(t *testing.T) {
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.Passthrough()
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	h.waitResponse(t)
+
+	// Body chunks in passthrough mode must return Continue immediately.
+	s1 := h.respBody([]byte("chunk1"), false)
+	s2 := h.respBody([]byte("chunk2"), true)
+	assert.Equal(t, shared.BodyStatusContinue, s1)
+	assert.Equal(t, shared.BodyStatusContinue, s2)
+}
+
+// TestResponse_Observe: tap mode — handler reads body chunks via r.Body
+// while they simultaneously flow to downstream. OnResponseBody returns Continue.
+func TestResponse_Observe(t *testing.T) {
+	var tapped []byte
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.Observe()
+			tapped, _ = io.ReadAll(r.Body)
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+
+	s1 := h.respBody([]byte("hello "), false)
+	s2 := h.respBody([]byte("world"), true)
+	h.waitResponse(t)
+
+	// Observe returns Continue — body flows to downstream simultaneously.
+	assert.Equal(t, shared.BodyStatusContinue, s1)
+	assert.Equal(t, shared.BodyStatusContinue, s2)
+	assert.Equal(t, "hello world", string(tapped))
+	assert.True(t, h.handle.continuedResp)
+}
+
+// TestResponse_Buffer: handler reads complete body before ContinueResponse.
+// OnResponseBody returns StopAndBuffer.
+func TestResponse_Buffer(t *testing.T) {
+	var buffered []byte
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.Buffer()
+			buffered, _ = io.ReadAll(r.Body)
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+
+	s1 := h.respBody([]byte("chunk1"), false)
+	s2 := h.respBody([]byte("chunk2"), true)
+	h.waitResponse(t)
+
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s1)
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s2)
+	assert.Equal(t, "chunk1chunk2", string(buffered))
+	assert.True(t, h.handle.continuedResp)
+}
+
+// TestResponse_NoRespHandler: filter registered without ResponseFunc — response
+// callbacks return Continue immediately, no goroutine involvement.
+func TestResponse_NoRespHandler(t *testing.T) {
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+
+	s := h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	assert.Equal(t, shared.HeadersStatusContinue, s)
+
+	sb := h.respBody([]byte("data"), true)
+	assert.Equal(t, shared.BodyStatusContinue, sb)
+}
+
+// TestResponse_DefaultPassthrough: ResponseFunc declared but no mode called —
+// defaults to Passthrough. ContinueResponse must still be called.
+func TestResponse_DefaultPassthrough(t *testing.T) {
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			// no mode declared — defaults to Passthrough
+			_ = r.StatusCode // just read headers
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"204"}}, true)
+	h.waitResponse(t)
+
+	assert.True(t, h.handle.continuedResp)
+}
+
+// TestResponse_ContextCancelledOnStreamComplete: client disconnect cancels
+// the context, unblocking a ResponseFunc waiting on r.Body.
+func TestResponse_ContextCancelledOnStreamComplete(t *testing.T) {
+	respStarted := make(chan struct{})
+	respDone := make(chan struct{})
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.Observe()
+			close(respStarted)
+			// Block reading body — will unblock when ctx is cancelled.
+			buf := make([]byte, 4)
+			for {
+				_, err := r.Body.Read(buf)
+				if err != nil {
+					break
+				}
+			}
+			close(respDone)
+		},
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+
+	// Wait for ResponseFunc to start blocking on Body.
+	select {
+	case <-respStarted:
+	case <-time.After(time.Second):
+		t.Fatal("response handler did not start")
+	}
+
+	// Simulate client disconnect.
+	h.filter.OnStreamComplete()
+
+	select {
+	case <-respDone:
+	case <-time.After(time.Second):
+		t.Fatal("response handler did not unblock after OnStreamComplete")
+	}
 }

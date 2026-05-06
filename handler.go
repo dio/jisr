@@ -196,7 +196,80 @@ type ResponseWriter interface {
 	SetMetadata(namespace, key string, value any)
 }
 
-// HandlerFunc is a function that handles an Envoy HTTP filter event.
+// ResponseFunc handles the response phase of a filter.
+// It runs in the same goroutine as the HandlerFunc for the same request,
+// after ContinueRequest has been called and the upstream response has arrived.
+//
+// The handler must declare its intent by calling one of:
+//
+//	r.Passthrough() — observe/mutate headers only, body streams through untouched
+//	r.Observe()     — tap body chunks as they stream to downstream (zero added latency)
+//	r.Buffer()      — accumulate full response body before returning (adds latency)
+//
+// If no mode is declared, Passthrough is assumed.
+type ResponseFunc func(ctx context.Context, w ResponseWriter, r *Response)
+
+// Response holds the upstream response visible to a ResponseFunc.
+type Response struct {
+	// Header contains the upstream response headers.
+	Header Header
+
+	// StatusCode is the upstream HTTP status code.
+	StatusCode int
+
+	// Body is a streaming io.Reader for the response body.
+	// Available in Observe and Buffer modes. In Passthrough mode, returns EOF immediately.
+	Body io.Reader
+
+	// internal — wired by the filter bridge
+	passthrough func()
+	observe     func()
+	buffer      func()
+}
+
+// Passthrough declares header-only mode. The response body streams to the downstream
+// client without being copied into Go memory. r.Body returns EOF immediately.
+// Use for response header inspection or mutation with zero body overhead.
+func (r *Response) Passthrough() {
+	if r.passthrough != nil {
+		r.passthrough()
+	}
+}
+
+// Observe declares tap mode. Response body chunks are copied into Go memory
+// as they arrive, but also forwarded to the downstream client immediately —
+// zero added downstream latency. r.Body is a streaming reader over the tapped chunks.
+// Use for SSE token counting, logging, metrics.
+func (r *Response) Observe() {
+	if r.observe != nil {
+		r.observe()
+	}
+}
+
+// Buffer declares buffer mode. The full response body is accumulated in Go memory
+// before the ResponseFunc returns. r.Body delivers the complete body.
+// Adds full response latency — the downstream client waits for the handler to return.
+// Use for response rewriting, JSON transformation, content filtering.
+func (r *Response) Buffer() {
+	if r.buffer != nil {
+		r.buffer()
+	}
+}
+
+// RegisterWithResponse associates both a request HandlerFunc and a response
+// ResponseFunc with an Envoy filter name. Both run in the same goroutine
+// and share the same context — cancellation (client disconnect) propagates to both.
+//
+//	jisr.RegisterWithResponse("my-filter", requestHandler, responseHandler)
+func RegisterWithResponse(name string, req HandlerFunc, resp ResponseFunc) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	registry[name] = req
+	respRegistry[name] = resp
+}
+
+
 //
 // Typical usage:
 //
@@ -236,6 +309,9 @@ func Chain(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
 // registry maps filter names to HandlerFuncs.
 var registry = map[string]HandlerFunc{}
 
+// respRegistry maps filter names to ResponseFuncs (optional, paired with registry).
+var respRegistry = map[string]ResponseFunc{}
+
 // rawRegistry maps filter names to raw SDK factories (escape hatch).
 var rawRegistry = map[string]shared.HttpFilterConfigFactory{}
 
@@ -273,6 +349,7 @@ func RegisterRaw(name string, factory shared.HttpFilterConfigFactory) {
 // Intended for use in tests — production code should not unregister filters.
 func Unregister(name string) {
 	delete(registry, name)
+	delete(respRegistry, name)
 	delete(rawRegistry, name)
 }
 
@@ -282,7 +359,7 @@ func Unregister(name string) {
 func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFactory {
 	m := make(map[string]shared.HttpFilterConfigFactory, len(registry)+len(rawRegistry))
 	for name, fn := range registry {
-		m[name] = &configFactory{name: name, handler: fn}
+		m[name] = &configFactory{name: name, handler: fn, respHandler: respRegistry[name]}
 	}
 	maps.Copy(m, rawRegistry)
 	return m
