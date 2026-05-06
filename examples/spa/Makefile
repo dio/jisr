@@ -1,33 +1,37 @@
 OUTPUT  := libspa.so
 GOCMD   := CGO_ENABLED=1 go
 UI_DIR  := ui
-DIST    := ui/dist
+DIST    := $(UI_DIR)/dist
+NM      := $(UI_DIR)/node_modules
 
-.PHONY: all build build-so ui clean tidy dev
+.PHONY: all build build-so ui install clean dev
 
+## all: full build — install npm deps, build Vite, compile .so
 all: build
 
-# Full build: Vite → embed → .so
+## build: install npm deps if needed, build Vite output, then compile .so
 build: ui build-so
 
-# Build the .so only (ui/dist must already exist).
+## build-so: compile the .so only (ui/dist must already exist)
 build-so:
 	$(GOCMD) build -trimpath -buildmode=c-shared -o $(OUTPUT) ./cmd
 
-# Build the Vite SPA. Requires Node.js + npm.
-# In CI: `npm ci && npm run build` in the ui/ directory.
-ui:
-	@if [ -d "$(UI_DIR)/node_modules" ] || [ -f "$(UI_DIR)/package.json" ]; then \
-		cd $(UI_DIR) && npm run build; \
-	else \
-		echo "No Vite project found in $(UI_DIR)/. Using pre-built dist/ assets."; \
-	fi
+## ui: install npm deps (if not present) and run vite build
+ui: $(NM)
+	cd $(UI_DIR) && npm run build
 
-# Run the Vite dev server (hot reload). Use alongside a running Envoy for API proxying.
+## install: install npm dependencies only
+$(NM): $(UI_DIR)/package.json
+	cd $(UI_DIR) && npm install
+	@touch $(NM)
+
+## dev: run the Vite dev server with HMR (port 5173)
+## Use this alongside a running Envoy to get hot-reload for UI changes.
+## Vite proxies /api/* to Envoy in dev mode — see ui/vite.config.ts.
 dev:
 	cd $(UI_DIR) && npm run dev
 
+## clean: remove the .so and built frontend assets
 clean:
 	rm -f $(OUTPUT) $(OUTPUT:.so=.h)
-
-tidy:
+	rm -rf $(DIST)

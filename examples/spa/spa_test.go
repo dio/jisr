@@ -3,6 +3,7 @@ package spa_test
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"strings"
 	"testing"
@@ -23,14 +24,14 @@ type mockWriter struct {
 
 func newMock() *mockWriter { return &mockWriter{headers: map[string]string{}} }
 
-func (m *mockWriter) Send(code int, body string)        { m.code = code; m.body = []byte(body) }
-func (m *mockWriter) SendBytes(code int, body []byte)   { m.code = code; m.body = body }
-func (m *mockWriter) SetRequestHeader(k, v string)      {}
-func (m *mockWriter) SetResponseHeader(k, v string)     { m.headers[k] = v }
-func (m *mockWriter) SetMetadata(_, _ string, _ any)    {}
-func (m *mockWriter) SetUpstreamResponseHeader(_, _ string) {}
-func (m *mockWriter) ReplaceBody(_ []byte)               {}
-func (m *mockWriter) ClearRouteCache()                   {}
+func (m *mockWriter) Send(code int, body string)                              { m.code = code; m.body = []byte(body) }
+func (m *mockWriter) SendBytes(code int, body []byte)                         { m.code = code; m.body = body }
+func (m *mockWriter) SetRequestHeader(k, v string)                            {}
+func (m *mockWriter) SetResponseHeader(k, v string)                           { m.headers[k] = v }
+func (m *mockWriter) SetMetadata(_, _ string, _ any)                          {}
+func (m *mockWriter) SetUpstreamResponseHeader(_, _ string)                   {}
+func (m *mockWriter) ReplaceBody(_ []byte)                                    {}
+func (m *mockWriter) ClearRouteCache()                                        {}
 func (m *mockWriter) IncrementCounter(_ jisr.MetricID, _ uint64, _ ...string) {}
 func (m *mockWriter) RecordHistogram(_ jisr.MetricID, _ uint64, _ ...string)  {}
 func (m *mockWriter) Stream(_ context.Context, _ [][2]string) (jisr.StreamWriter, error) {
@@ -39,14 +40,32 @@ func (m *mockWriter) Stream(_ context.Context, _ [][2]string) (jisr.StreamWriter
 
 func req(path string) *jisr.Request {
 	return &jisr.Request{
-		// Use lowercase pseudo-headers as Envoy delivers them.
-		// jisr's bridge applies http.CanonicalHeaderKey which leaves :path as-is.
 		Header: http.Header{
 			":path":   {path},
 			":method": {"GET"},
 		},
 		Body: strings.NewReader(""),
 	}
+}
+
+// assetPath returns the first embedded asset path matching the given extension.
+// Vite fingerprints filenames (e.g. index-4zgxRtfG.css), so tests must
+// discover the actual filename rather than hardcoding it.
+func assetPath(t *testing.T, ext string) string {
+	t.Helper()
+	var found string
+	fs.WalkDir(spa.UIFS, "ui/dist/assets", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if strings.HasSuffix(path, ext) {
+			// Strip "ui/dist" prefix to get the URL path.
+			found = strings.TrimPrefix(path, "ui/dist")
+		}
+		return nil
+	})
+	require.NotEmpty(t, found, "no asset with extension %q found in ui/dist/assets", ext)
+	return found
 }
 
 // ── SPA handler tests ─────────────────────────────────────────────────────────
@@ -58,28 +77,31 @@ func TestSPA_ServesIndexHTML(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.code)
 	assert.Contains(t, w.headers["content-type"], "text/html")
 	assert.Contains(t, string(w.body), "<html")
-	assert.Contains(t, string(w.body), "jisr SPA example")
+	// Vite injects the fingerprinted script tag — just check the SPA shell is present.
+	assert.Contains(t, string(w.body), `id="root"`)
 }
 
 func TestSPA_ServesJSAsset(t *testing.T) {
+	js := assetPath(t, ".js")
 	w := newMock()
-	spa.SPAHandler(context.Background(), w, req("/assets/index.js"))
+	spa.SPAHandler(context.Background(), w, req(js))
 
 	assert.Equal(t, http.StatusOK, w.code)
 	assert.Contains(t, w.headers["content-type"], "javascript")
-	assert.Contains(t, string(w.body), "fetch")
+	assert.Greater(t, len(w.body), 0)
 }
 
 func TestSPA_ServesCSSAsset(t *testing.T) {
+	css := assetPath(t, ".css")
 	w := newMock()
-	spa.SPAHandler(context.Background(), w, req("/assets/index.css"))
+	spa.SPAHandler(context.Background(), w, req(css))
 
 	assert.Equal(t, http.StatusOK, w.code)
 	assert.Contains(t, w.headers["content-type"], "css")
+	assert.Greater(t, len(w.body), 0)
 }
 
 func TestSPA_FallsBackToIndexHTML_UnknownRoute(t *testing.T) {
-	// Client-side route — SPA router handles it in the browser.
 	w := newMock()
 	spa.SPAHandler(context.Background(), w, req("/dashboard/settings"))
 
@@ -97,9 +119,9 @@ func TestSPA_FallsBackToIndexHTML_DeepRoute(t *testing.T) {
 }
 
 func TestSPA_CacheControl_Assets(t *testing.T) {
-	// /assets/index.js exists in ui/dist — assets get long-lived cache headers.
+	js := assetPath(t, ".js")
 	w := newMock()
-	spa.SPAHandler(context.Background(), w, req("/assets/index.js"))
+	spa.SPAHandler(context.Background(), w, req(js))
 
 	assert.Equal(t, http.StatusOK, w.code)
 	assert.Contains(t, w.headers["cache-control"], "immutable")
@@ -113,8 +135,9 @@ func TestSPA_CacheControl_Index(t *testing.T) {
 }
 
 func TestSPA_StripQueryString(t *testing.T) {
+	js := assetPath(t, ".js")
 	w := newMock()
-	spa.SPAHandler(context.Background(), w, req("/assets/index.js?v=123"))
+	spa.SPAHandler(context.Background(), w, req(js+"?v=123"))
 
 	assert.Equal(t, http.StatusOK, w.code)
 	assert.Contains(t, w.headers["content-type"], "javascript")

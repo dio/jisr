@@ -41,12 +41,11 @@ import (
 	"github.com/dio/jisr"
 )
 
-// ui holds the compiled Vite output.
-// In a real project: //go:embed ui/dist
-// We embed the whole subtree so assets/ subdirectory is included.
+// UIFS holds the compiled Vite output, exported for testing.
+// Tests use it to discover fingerprinted asset filenames at runtime.
 //
 //go:embed ui/dist
-var uiFS embed.FS
+var UIFS embed.FS
 
 // indexHTML is the SPA shell — served for every path that isn't a known asset.
 //
@@ -72,7 +71,7 @@ func SPAHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 
 	// Try to serve the exact asset from the embedded FS.
 	fsPath := "ui/dist" + path
-	data, err := fs.ReadFile(uiFS, fsPath)
+	data, err := fs.ReadFile(UIFS, fsPath)
 	if err == nil {
 		// Asset found — detect MIME type from extension.
 		ct := mime.TypeByExtension(filepath.Ext(path))
