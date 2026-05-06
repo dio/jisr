@@ -96,16 +96,16 @@ func init() {
 			// loggingMiddleware runs first, then f.HandleRequest.
 			// If HandleRequest short-circuits (401), loggingMiddleware still
 			// logs the outcome because it wraps the full call.
-			return jisr.Chain(f.HandleRequest, loggingMiddleware), f.HandleResponse, nil
+			return jisr.Chain(f.HandleRequest, loggingMiddleware),
+				jisr.ResponseChain(f.HandleResponse, responseLoggingMiddleware),
+				nil
 		},
 		jisr.ResponseModePassthrough,
 	)
 }
 
-// loggingMiddleware logs every request with its path, method, and outcome.
-// It is a jisr.Middleware: a function that wraps a HandlerFunc.
-// Defined at package level — it has no per-config state, so it doesn't need
-// to be a method on AuthFilter.
+// loggingMiddleware logs every request with its path and method.
+// Stateless — defined at package level, no per-config state needed.
 func loggingMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 		r.Log(jisr.LogInfo, "auth: %s %s",
@@ -113,6 +113,18 @@ func loggingMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 			r.GetAttr(jisr.AttrRequestPath),
 		)
 		next(ctx, w, r)
+	}
+}
+
+// responseLoggingMiddleware demonstrates jisr.ResponseMiddleware — it wraps a
+// ResponseFunc with before/after logic, running around the upstream response.
+// The response phase runs in the same goroutine as the request phase.
+func responseLoggingMiddleware(next jisr.ResponseFunc) jisr.ResponseFunc {
+	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+		next(ctx, w, r)
+		// Post-response: set a metadata marker to show the middleware ran.
+		// In production this could emit a metric, record latency, etc.
+		w.SetMetadata("auth", "response_logged", true)
 	}
 }
 

@@ -59,15 +59,25 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 
 ## Middleware
 
-`Chain` composes middleware in declaration order. The first middleware is the
-outermost wrapper — it runs first on the way in and last on the way out:
+`Chain` composes request middleware in declaration order. The first middleware
+is the outermost wrapper — it runs first on the way in and last on the way out:
 
 ```go
 jisr.Register("my-filter", jisr.Chain(myHandler, logging, auth))
 // execution order: logging → auth → myHandler
 ```
 
-A `jisr.Middleware` is a function that wraps a `HandlerFunc`:
+`ResponseChain` does the same for the response phase:
+
+```go
+jisr.RegisterWithResponse("my-filter", reqFn,
+    jisr.ResponseChain(respHandler, metrics, logging),
+    jisr.ResponseModeObserve,
+)
+```
+
+A `jisr.Middleware` wraps a `HandlerFunc`; a `jisr.ResponseMiddleware` wraps a
+`ResponseFunc`:
 
 ```go
 func logging(next jisr.HandlerFunc) jisr.HandlerFunc {
@@ -87,17 +97,23 @@ func auth(next jisr.HandlerFunc) jisr.HandlerFunc {
         next(ctx, w, r)
     }
 }
+
+func metricsMiddleware(next jisr.ResponseFunc) jisr.ResponseFunc {
+    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+        next(ctx, w, r)
+        w.IncrementCounter(responsesTotal, 1, statusBucket(r.StatusCode))
+    }
+}
 ```
 
 Middleware runs in the same goroutine as the handler. `context.Context`
 cancellation (client disconnect) propagates through the chain automatically.
 
-Chain is zero-allocation after construction — the composed function is a
-plain closure, no per-request allocation.
+Both `Chain` and `ResponseChain` are zero-allocation after construction.
 
 See [examples/auth](examples/auth) for a complete example: `loggingMiddleware`
-is composed with `f.HandleRequest` inside a `RegisterFactoryWithResponse` factory,
-showing how stateless middleware can wrap a struct-bound handler.
+wraps the request handler and `responseLoggingMiddleware` wraps the response
+handler, both composed inside a `RegisterFactoryWithResponse` factory.
 
 ## Modifying the upstream response
 
@@ -302,7 +318,8 @@ See [examples/decoder](examples/decoder) for the full runnable example.
 | `RegisterFactory(name, factoryFn)` | Request-only; factory constructs handler from config context — use when handler needs per-config state (parsed config, metric IDs) without package-level vars |
 | `RegisterFactoryWithResponse(name, factoryFn, mode)` | Full lifecycle; factory constructs both request and response handlers from config context |
 | `RegisterRaw(name, factory)` | Escape hatch: raw SDK factory |
-| `Chain(handler, middlewares...)` | Compose middleware (outermost first) |
+| `Chain(handler, middlewares...)` | Compose request middleware (outermost first) |
+| `ResponseChain(handler, middlewares...)` | Compose response middleware (outermost first) |
 
 ### Request (`*jisr.Request`)
 

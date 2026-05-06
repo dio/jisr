@@ -1651,3 +1651,40 @@ func TestRegisterFactory_PanicOnDuplicate(t *testing.T) {
 		})
 	})
 }
+
+// ── ResponseChain ──────────────────────────────────────────────────────────────
+
+func TestResponseChain_ExecutionOrder(t *testing.T) {
+	var order []string
+
+	a := func(next jisr.ResponseFunc) jisr.ResponseFunc {
+		return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			order = append(order, "a-before")
+			next(ctx, w, r)
+			order = append(order, "a-after")
+		}
+	}
+	b := func(next jisr.ResponseFunc) jisr.ResponseFunc {
+		return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			order = append(order, "b-before")
+			next(ctx, w, r)
+			order = append(order, "b-after")
+		}
+	}
+	base := func(_ context.Context, _ jisr.ResponseWriter, _ *jisr.Response) {
+		order = append(order, "handler")
+	}
+
+	chained := jisr.ResponseChain(base, a, b)
+	chained(context.Background(), newMockWriter(), &jisr.Response{})
+
+	// a is outermost → runs first in, last out
+	assert.Equal(t, []string{"a-before", "b-before", "handler", "b-after", "a-after"}, order)
+}
+
+func TestResponseChain_NoMiddleware(t *testing.T) {
+	called := false
+	base := func(_ context.Context, _ jisr.ResponseWriter, _ *jisr.Response) { called = true }
+	jisr.ResponseChain(base)(context.Background(), newMockWriter(), &jisr.Response{})
+	assert.True(t, called)
+}

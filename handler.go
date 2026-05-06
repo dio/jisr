@@ -489,6 +489,29 @@ func Chain(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
 	return h
 }
 
+// ResponseMiddleware wraps a ResponseFunc, returning a new ResponseFunc.
+// Use with [ResponseChain] to compose response-phase middleware.
+//
+//	func metricsMiddleware(next jisr.ResponseFunc) jisr.ResponseFunc {
+//	    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+//	        next(ctx, w, r)
+//	        w.IncrementCounter(responsesTotal, 1)
+//	    }
+//	}
+type ResponseMiddleware func(ResponseFunc) ResponseFunc
+
+// ResponseChain applies response middleware to a ResponseFunc in declaration order.
+// The first middleware is the outermost wrapper (runs first):
+//
+//	jisr.ResponseChain(handler, metrics, logging)
+//	// execution order: metrics → logging → handler
+func ResponseChain(h ResponseFunc, middlewares ...ResponseMiddleware) ResponseFunc {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}
+
 // registry maps filter names to HandlerFuncs.
 var registry = map[string]HandlerFunc{}
 
