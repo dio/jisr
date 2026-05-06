@@ -28,6 +28,7 @@ var (
 	projectRoot string
 	envoyCmd    *exec.Cmd
 	echoServer  *http.Server
+	resetPort   int // TCP port that accepts then immediately RSTs — upstream reset-before-connect
 )
 
 func TestMain(m *testing.M) {
@@ -37,7 +38,11 @@ func TestMain(m *testing.M) {
 	// 1. Start the echo backend on a random free port.
 	backendPort := startEchoBackend()
 
-	// 2. Build libhello.so unless JISR_SKIP_BUILD=1.
+	// 2. Start the RST backend — accepts TCP connections then immediately closes them.
+	// Used to simulate upstream connection reset before any data.
+	resetPort = startRSTBackend()
+
+	// 3. Build libhello.so unless JISR_SKIP_BUILD=1.
 	if os.Getenv("JISR_SKIP_BUILD") == "" {
 		soPath := filepath.Join(projectRoot, "libhello.so")
 		fmt.Fprintln(os.Stderr, "e2e: building libhello.so …")
@@ -53,14 +58,14 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: build OK")
 	}
 
-	// 3. Start Envoy with a generated config.
+	// 4. Start Envoy with a generated config.
 	envoyBin := os.Getenv("ENVOY_BIN")
 	if envoyBin == "" {
 		home, _ := os.UserHomeDir()
 		envoyBin = filepath.Join(home, ".local/share/boe/envoy-versions/1.37.1/bin/envoy")
 	}
 
-	cfgPath := writeEnvoyConfig(backendPort)
+	cfgPath := writeEnvoyConfig(backendPort, resetPort)
 	defer os.Remove(cfgPath)
 
 	envoyCmd = exec.Command(envoyBin, "-c", cfgPath, "--log-level", "warning")
@@ -96,8 +101,9 @@ func TestMain(m *testing.M) {
 //
 //	/          — JSON echo of path, method, headers
 //	/body      — returns a fixed JSON body (useful for byte-count tests)
-//	/slow      — writes headers + one chunk, then abruptly closes (upstream disconnect)
-//	/chunked   — sends body in known chunks, then closes cleanly
+//	/slow      — writes headers + one chunk, then abruptly closes (upstream disconnect after data)
+//	/chunked   — sends body in two known chunks, then closes cleanly
+//	/hold      — sends headers + first chunk, then blocks until request context is cancelled
 func startEchoBackend() int {
 	mux := http.NewServeMux()
 
@@ -138,7 +144,7 @@ func startEchoBackend() int {
 		flusher.Flush()
 	})
 
-	// /slow — abruptly closes the TCP connection mid-response (upstream disconnect).
+	// /slow — abruptly closes the TCP connection mid-response (upstream disconnect after data).
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -146,13 +152,33 @@ func startEchoBackend() int {
 			return
 		}
 		conn, buf, _ := hj.Hijack()
-		// Write a valid HTTP response header + one partial chunk.
+		// Write valid HTTP response headers + one complete chunk.
 		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n")
 		buf.WriteString("5\r\nhello\r\n") // valid first chunk
 		buf.Flush()
-		// Abruptly close without the final 0-length terminating chunk.
-		// Envoy will detect the incomplete response and call OnStreamComplete.
+		// Abruptly close — no terminating 0-length chunk.
+		// Envoy detects the incomplete response and calls OnStreamComplete.
 		conn.Close()
+	})
+
+	// /hold — sends headers + first chunk, then blocks until the client disconnects.
+	// Used to simulate: upstream is alive but slow; client disconnects first.
+	mux.HandleFunc("/hold", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("content-type", "text/plain")
+		w.Header().Set("transfer-encoding", "chunked")
+		// Send the status line and headers.
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		// Send one chunk so the filter's OnResponseBody fires.
+		fmt.Fprint(w, "partial-data")
+		flusher.Flush()
+		// Block until the client or Envoy drops the connection.
+		<-r.Context().Done()
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -167,8 +193,31 @@ func startEchoBackend() int {
 	return port
 }
 
-// writeEnvoyConfig writes a temp envoy config with the backend port substituted.
-func writeEnvoyConfig(backendPort int) string {
+// startRSTBackend starts a TCP listener that accepts connections and immediately
+// closes them — simulating upstream connection reset before any HTTP data.
+// Envoy will see a connection error and generate a 503 response to the client.
+func startRSTBackend() int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: rst backend listen failed: %v\n", err)
+		os.Exit(1)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed at test teardown
+			}
+			conn.Close() // immediate RST — no data written
+		}
+	}()
+	fmt.Fprintf(os.Stderr, "e2e: rst backend listening on 127.0.0.1:%d\n", port)
+	return port
+}
+
+// writeEnvoyConfig writes a temp envoy config with backend/reset ports substituted.
+func writeEnvoyConfig(backendPort, rstPort int) string {
 	cfg := fmt.Sprintf(`
 admin:
   address:
@@ -292,11 +341,51 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: backend }
 
+    # Port 10004 — resp-tap on noconnect cluster (upstream RST before connect).
+    - name: resp-tap-rst
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10004 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: resp_tap_rst
+                http_filters:
+                  - name: resp-tap
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: resp-tap
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: tap_rst
+                  virtual_hosts:
+                    - name: noconnect
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: noconnect }
+
   clusters:
     - name: backend
       type: STATIC
       load_assignment:
         cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+
+    # noconnect — points to RST backend (accepts then immediately closes).
+    - name: noconnect
+      type: STATIC
+      load_assignment:
+        cluster_name: noconnect
         endpoints:
           - lb_endpoints:
               - endpoint:
@@ -313,7 +402,7 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: { address: 127.0.0.1, port_value: 1 }
-`, backendPort)
+`, backendPort, rstPort)
 
 	f, err := os.CreateTemp("", "jisr-e2e-*.yaml")
 	if err != nil {

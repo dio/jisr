@@ -101,75 +101,160 @@ func TestRespPhase_TapChunkedBodyForwarded(t *testing.T) {
 	assert.Contains(t, s, "chunk-two", "second chunk must arrive")
 }
 
-// TestRespPhase_UpstreamDisconnect verifies that when the upstream backend
-// abruptly closes the TCP connection mid-response, the filter's ResponseFunc
-// exits cleanly (via io.Copy returning an error / channel close) and Envoy
-// remains healthy for subsequent requests.
-func TestRespPhase_UpstreamDisconnect(t *testing.T) {
-	// /slow: backend sends headers + one chunk then closes the TCP connection.
-	// The client may receive an error or a partial response — both are OK.
-	// The critical assertions: no panic, no goroutine leak, Envoy stays healthy.
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(envoyTapAddr + "/slow")
-	if err == nil {
-		io.ReadAll(resp.Body)
-		resp.Body.Close()
-	}
-	// err != nil is acceptable — Envoy aborted the response to the client.
+// ── Disconnect test cases ─────────────────────────────────────────────────────
+//
+// Four scenarios, two axes:
+//
+//   client disconnect:
+//     A. before upstream responds        (goroutine parked on respHeadersCh)
+//     B. after upstream headers + data   (goroutine reading r.Body mid-stream)
+//
+//   upstream disconnect:
+//     C. after sending partial data      (/slow — incomplete chunked response)
+//     D. before sending any data (RST)   (/noconnect cluster — Envoy 503)
 
-	// Envoy must still be healthy after the upstream disconnect.
-	require.True(t, envoyHealthy(t),
-		"Envoy must remain healthy after upstream abrupt close")
-
-	// A subsequent request to the tap filter must complete normally.
-	resp2, err := client.Get(envoyTapAddr + "/body")
-	require.NoError(t, err, "next request must succeed after upstream disconnect")
-	defer resp2.Body.Close()
-	require.Equal(t, http.StatusOK, resp2.StatusCode)
-	body2, err := io.ReadAll(resp2.Body)
-	require.NoError(t, err)
-	assert.Contains(t, string(body2), "hello from backend",
-		"body must be intact on request after upstream disconnect")
-}
-
-// TestRespPhase_ClientDisconnect verifies that when the downstream client
-// abruptly closes the TCP connection mid-stream, the ResponseFunc's io.Copy
-// returns (channel closed by OnStreamComplete), and Envoy remains healthy.
-func TestRespPhase_ClientDisconnect(t *testing.T) {
-	// Connect via raw TCP so we can abort mid-stream.
+// TestDisconnect_ClientBeforeUpstreamResponds — case A.
+// Client closes the TCP connection while the filter goroutine is blocked
+// waiting on respHeadersCh (ContinueRequest has been called but the upstream
+// hasn't responded yet). OnStreamComplete fires, cancels the context, the
+// goroutine unblocks from the select and exits cleanly.
+func TestDisconnect_ClientBeforeUpstreamResponds(t *testing.T) {
+	// /hold: backend sends headers + one chunk, then blocks.
+	// We disconnect *before* even reading the response status line so we
+	// race with the upstream connection — the goroutine is most likely
+	// parked on respHeadersCh when OnStreamComplete fires.
 	addr := strings.TrimPrefix(envoyTapAddr, "http://")
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	require.NoError(t, err)
 
-	// Send a valid HTTP/1.1 GET for /chunked (slow enough to disconnect mid-body).
-	req := "GET /chunked HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	// Send request.
+	req := "GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 	_, err = conn.Write([]byte(req))
 	require.NoError(t, err)
 
-	// Read the status line to confirm Envoy started responding.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 128)
-	n, _ := conn.Read(buf)
-	statusPart := string(buf[:n])
-	assert.Contains(t, statusPart, "200", "Envoy must begin the response before we disconnect")
-
-	// Abruptly close — simulates browser tab close / network drop.
+	// Close immediately — before reading any response.
+	// The goroutine is either waiting for upstream headers or has just received them.
 	conn.Close()
 
-	// Give Envoy a moment to detect the RST and call OnStreamComplete.
+	// Give Envoy time to process the client RST.
 	time.Sleep(200 * time.Millisecond)
 
-	// Envoy must still be healthy.
-	require.True(t, envoyHealthy(t),
-		"Envoy must remain healthy after client abrupt close")
+	require.True(t, envoyHealthy(t), "Envoy must survive client disconnect before upstream responds")
 
-	// Subsequent request must succeed cleanly.
+	// Subsequent request must complete normally.
 	resp, err := http.Get(envoyTapAddr + "/body")
-	require.NoError(t, err, "subsequent request must succeed after client disconnect")
+	require.NoError(t, err, "next request must work after case-A disconnect")
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, _ := io.ReadAll(resp.Body)
-	assert.Contains(t, string(body), "hello from backend")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestDisconnect_ClientAfterPartialResponse — case B.
+// Client closes TCP after receiving response headers + first body chunk,
+// while the filter goroutine is reading r.Body. OnStreamComplete closes
+// respBodyCh, io.Copy in the ResponseFunc returns, goroutine exits cleanly.
+func TestDisconnect_ClientAfterPartialResponse(t *testing.T) {
+	// /hold: backend sends "partial-data" then blocks. We read the status line
+	// + headers + first chunk, then close — simulating a tab close mid-stream.
+	addr := strings.TrimPrefix(envoyTapAddr, "http://")
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	req := "GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+	_, err = conn.Write([]byte(req))
+	require.NoError(t, err)
+
+	// Read until we see some body data — confirms the filter's OnResponseBody fired.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 512)
+	var received string
+	for !strings.Contains(received, "partial-data") {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			received += string(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	assert.Contains(t, received, "partial-data", "must receive at least the first chunk before disconnecting")
+
+	// Now abruptly close — goroutine is reading r.Body.
+	conn.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	require.True(t, envoyHealthy(t), "Envoy must survive client disconnect mid-body")
+
+	resp, err := http.Get(envoyTapAddr + "/body")
+	require.NoError(t, err, "next request must work after case-B disconnect")
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestDisconnect_UpstreamAfterPartialData — case C.
+// Upstream sends HTTP headers + one valid chunk, then abruptly closes the TCP
+// connection without the terminating 0-length chunk. Envoy detects the error,
+// calls OnStreamComplete, which closes respBodyCh. The goroutine's io.Copy
+// returns and the goroutine exits cleanly.
+func TestDisconnect_UpstreamAfterPartialData(t *testing.T) {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// /slow: backend sends headers + "hello" chunk then RSTs.
+	// The downstream client may receive an error or a truncated response.
+	resp, err := client.Get(envoyTapAddr + "/slow")
+	if err == nil {
+		// Envoy may forward partial data before detecting the upstream RST.
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		// If Envoy forwards the partial body before detecting the RST, it's fine.
+		t.Logf("upstream partial data received: status=%d body=%q", resp.StatusCode, body)
+	} else {
+		// Envoy aborted the response to us — also acceptable.
+		t.Logf("client got error (expected): %v", err)
+	}
+
+	require.True(t, envoyHealthy(t), "Envoy must survive upstream disconnect after partial data")
+
+	// Subsequent request must work — goroutine must have exited cleanly.
+	resp2, err := client.Get(envoyTapAddr + "/body")
+	require.NoError(t, err, "next request must work after case-C upstream disconnect")
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
+	body2, _ := io.ReadAll(resp2.Body)
+	assert.Contains(t, string(body2), "hello from backend")
+}
+
+// TestDisconnect_UpstreamResetBeforeData — case D.
+// Upstream accepts the TCP connection then immediately closes it (RST) without
+// sending any HTTP data. Envoy never calls OnResponseHeaders — the filter
+// goroutine is parked on respHeadersCh forever. OnStreamComplete fires
+// (context cancelled), the select unblocks with ctx.Done(), goroutine exits.
+// Envoy sends 503 to the downstream client.
+func TestDisconnect_UpstreamResetBeforeData(t *testing.T) {
+	// Port 10004 routes to noconnect cluster (RST backend).
+	rstAddr := "http://localhost:10004"
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Get(rstAddr + "/")
+	if err == nil {
+		defer resp.Body.Close()
+		io.ReadAll(resp.Body)
+		// Envoy returns 503 (upstream connection failure) — the filter goroutine
+		// must have exited via ctx.Done() on the respHeadersCh select.
+		t.Logf("upstream RST: Envoy returned %d (expected 503)", resp.StatusCode)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+			"Envoy must return 503 when upstream resets before sending data")
+	} else {
+		t.Logf("client got error (Envoy closed connection): %v", err)
+	}
+
+	require.True(t, envoyHealthy(t), "Envoy must survive upstream RST before any data")
+
+	// Goroutine must have exited — subsequent request on tap port must work.
+	resp2, err := client.Get(envoyTapAddr + "/body")
+	require.NoError(t, err, "next request on tap port must work after case-D disconnect")
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
 }
 
 // TestRespPhase_HelloFilterUnaffected verifies that the existing hello filter
