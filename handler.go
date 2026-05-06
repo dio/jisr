@@ -357,6 +357,29 @@ type Response struct {
 	// Nil in ResponseModePassthrough: the body streams through without
 	// being copied into Go memory.
 	Body io.Reader
+
+	// internal
+	skipBody func()
+}
+
+// SkipBody signals jisr that this response handler will not read the response
+// body. The body channel is closed immediately so the goroutine unblocks, and
+// subsequent OnResponseBody chunks are forwarded to the downstream client
+// without being copied into Go memory.
+//
+// Use when you only need response headers and want to add or inspect them
+// without buffering the body:
+//
+//	func stampHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+//	    r.SkipBody()
+//	    w.SetUpstreamResponseHeader("x-processed-by", "jisr")
+//	}
+//
+// SkipBody is a no-op in ResponseModePassthrough (Body is already nil).
+func (r *Response) SkipBody() {
+	if r.skipBody != nil {
+		r.skipBody()
+	}
 }
 
 // RegisterWithResponse associates both a request HandlerFunc and a response

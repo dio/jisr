@@ -92,7 +92,7 @@ func enricher(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 jisr.RegisterWithResponse("header-stamp", skipBodyFn, stamp, jisr.ResponseModeBuffer)
 
 func stamp(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-    io.Copy(io.Discard, r.Body) // drain body — not modifying it, but must read to unblock
+    r.SkipBody() // not modifying the body — forward it as-is, unblock immediately
     w.SetUpstreamResponseHeader("x-processed-by", "jisr")
     w.SetUpstreamResponseHeader("x-upstream-status", strconv.Itoa(r.StatusCode))
 }

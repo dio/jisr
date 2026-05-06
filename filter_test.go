@@ -1526,3 +1526,48 @@ func TestRequest_GetAttr_EmptyWhenNoAttrs(t *testing.T) {
 	h.headers(map[string][]string{":path": {"/"}}, true)
 	h.wait(t)
 }
+
+// ── Response.SkipBody ─────────────────────────────────────────────────────────
+
+func TestResponse_SkipBody_UnblocksGoroutine(t *testing.T) {
+	// Buffer mode: r.SkipBody() must unblock the response handler immediately
+	// without reading any body bytes.
+	done := make(chan struct{})
+	h := newHarnessWithResponse(t,
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			r.SkipBody() // must not block
+			close(done)
+		},
+		jisr.ResponseModeBuffer,
+	)
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	h.respBody([]byte("body data"), true)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SkipBody did not unblock response handler")
+	}
+}
+
+func TestResponse_SkipBody_NoOpInPassthrough(t *testing.T) {
+	// Passthrough mode: Body is nil; SkipBody must not panic.
+	done := make(chan struct{})
+	h := newHarnessWithResponse(t,
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			assert.Nil(t, r.Body)
+			r.SkipBody() // no-op: Body is nil in Passthrough
+			close(done)
+		},
+		jisr.ResponseModePassthrough,
+	)
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.respHeaders(map[string][]string{":status": {"200"}}, true) // endStream=true
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Passthrough response handler did not complete")
+	}
+}

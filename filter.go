@@ -89,6 +89,7 @@ type handlerFilter struct {
 	respBodyCh     chan<- []byte
 	respBodyReader *bodyReader
 	respBodyDone   atomic.Bool
+	respBodySkip   atomic.Bool // true after r.SkipBody() on Response: pass body through unread
 
 	// response writer state (accumulated on goroutine, flushed via scheduler)
 	rw *responseWriterImpl
@@ -342,6 +343,11 @@ func (f *handlerFilter) OnResponseBody(body shared.BodyBuffer, endStream bool) s
 		return shared.BodyStatusContinue
 	}
 
+	// r.SkipBody() was called: pass all remaining chunks through unread.
+	if f.respBodySkip.Load() {
+		return shared.BodyStatusContinue
+	}
+
 	switch f.respMode {
 	case ResponseModePassthrough:
 		// Header-only: body streams through without touching Go memory.
@@ -486,6 +492,15 @@ func (f *handlerFilter) run(req *Request) {
 		Header:     respHeaders,
 		StatusCode: statusCode,
 		Body:       body,
+		skipBody: func() {
+			// CAS prevents double-close if both SkipBody and OnStreamComplete race.
+			if f.respBodyDone.CompareAndSwap(false, true) {
+				f.respBodySkip.Store(true)
+				if f.respBodyCh != nil {
+					close(f.respBodyCh)
+				}
+			}
+		},
 	}
 
 	f.respHandler(f.ctx, f.rw, resp)

@@ -111,13 +111,10 @@ func respRewriteHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Respon
 }
 
 // respHeaderStampHandler adds x-jisr-stamp to the upstream response headers
-// using Buffer mode so the header mutation is applied before ContinueResponse.
-// In Passthrough mode, Envoy may have already forwarded body chunks before
-// the scheduled header mutation fires — Buffer mode avoids this race.
+// using Buffer mode. r.SkipBody() tells jisr not to read the body — it is
+// forwarded to the client unchanged while the goroutine unblocks immediately.
 func respHeaderStampHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-	// Drain the body — we don't modify it, but we must read it in Buffer mode
-	// so the goroutine unblocks and the scheduler can call ContinueResponse.
-	io.Copy(io.Discard, r.Body) //nolint:errcheck
+	r.SkipBody()
 	w.SetUpstreamResponseHeader("x-jisr-stamp", strconv.Itoa(r.StatusCode))
 }
 func echoHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
