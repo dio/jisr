@@ -1,0 +1,198 @@
+package jisr
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
+)
+
+// --- configFactory: HttpFilterConfigFactory ---
+
+type configFactory struct {
+	name    string
+	handler HandlerFunc
+}
+
+func (f *configFactory) Create(
+	_ shared.HttpFilterConfigHandle,
+	_ []byte,
+) (shared.HttpFilterFactory, error) {
+	return &filterFactory{name: f.name, handler: f.handler}, nil
+}
+
+func (f *configFactory) CreatePerRoute(_ []byte) (any, error) {
+	return nil, nil
+}
+
+// --- filterFactory: HttpFilterFactory ---
+
+type filterFactory struct {
+	name    string
+	handler HandlerFunc
+}
+
+func (f *filterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFilter {
+	return &handlerFilter{
+		handle:  handle,
+		handler: f.handler,
+		name:    f.name,
+	}
+}
+
+func (f *filterFactory) OnDestroy() {}
+
+// --- handlerFilter: HttpFilter ---
+
+type handlerFilter struct {
+	shared.EmptyHttpFilter
+
+	handle  shared.HttpFilterHandle
+	handler HandlerFunc
+	name    string
+
+	// set in OnRequestHeaders, used across callbacks
+	scheduler shared.Scheduler
+	ctx       context.Context
+	cancel    context.CancelFunc
+
+	// body pipeline
+	bodyCh     chan<- []byte
+	bodyReader *bodyReader
+	bodyDone   bool // true once endStream seen in OnRequestBody
+
+	// response writer state (accumulated on goroutine, flushed via scheduler)
+	rw *responseWriterImpl
+}
+
+// responseWriterImpl accumulates mutations the user makes during the handler call.
+// These are applied back on the Envoy worker thread via the Scheduler.
+type responseWriterImpl struct {
+	filter    *handlerFilter
+	responded bool // true if SendError was called
+
+	headerMuts []headerMutation
+	metaMuts   []metaMutation
+}
+
+type headerMutation struct{ key, value string }
+type metaMutation struct {
+	namespace, key string
+	value          any
+}
+
+func (w *responseWriterImpl) SendError(statusCode int, body string) {
+	w.sendErrorBytes(statusCode, []byte(body))
+}
+
+func (w *responseWriterImpl) SendErrorBytes(statusCode int, body []byte) {
+	w.sendErrorBytes(statusCode, body)
+}
+
+func (w *responseWriterImpl) sendErrorBytes(statusCode int, body []byte) {
+	w.responded = true
+	w.filter.scheduler.Schedule(func() {
+		w.filter.handle.SendLocalResponse(
+			uint32(statusCode), nil, body,
+			fmt.Sprintf("jisr-filter:%s", w.filter.name),
+		)
+	})
+}
+
+func (w *responseWriterImpl) SetRequestHeader(key, value string) {
+	w.headerMuts = append(w.headerMuts, headerMutation{key, value})
+}
+
+func (w *responseWriterImpl) SetMetadata(namespace, key string, value any) {
+	w.metaMuts = append(w.metaMuts, metaMutation{namespace, key, value})
+}
+
+// OnRequestHeaders is called by Envoy on the worker thread when request headers arrive.
+func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream bool) shared.HeadersStatus {
+	// Capture scheduler BEFORE spawning goroutine — must be on worker thread.
+	f.scheduler = f.handle.GetScheduler()
+	f.ctx, f.cancel = context.WithCancel(context.Background())
+
+	// Copy all headers into Go-owned memory (no UnsafeEnvoyBuffer leaking).
+	h := make(http.Header)
+	for _, kv := range headers.GetAll() {
+		k := kv[0].ToString()
+		v := kv[1].ToString()
+		h[k] = append(h[k], v)
+	}
+
+	// Set up body pipeline.
+	var bodyCh chan<- []byte
+	f.bodyReader, bodyCh = newBodyReader()
+	f.bodyCh = bodyCh
+
+	if endStream {
+		// No body coming — close channel immediately so io.ReadAll returns empty.
+		close(bodyCh)
+		f.bodyDone = true
+	}
+
+	req := &Request{
+		Header:     h,
+		Body:       f.bodyReader,
+		FilterName: f.name,
+	}
+	f.rw = &responseWriterImpl{filter: f}
+
+	go f.run(req)
+
+	return shared.HeadersStatusStopAllAndBuffer
+}
+
+// OnRequestBody is called by Envoy on the worker thread for each body chunk.
+func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) shared.BodyStatus {
+	if f.bodyDone {
+		return shared.BodyStatusContinue
+	}
+	// Push copied chunks into the body channel for the goroutine to consume.
+	for _, chunk := range body.GetChunks() {
+		data := chunk.ToBytes() // copies into Go heap
+		select {
+		case f.bodyCh <- data:
+		case <-f.ctx.Done():
+			return shared.BodyStatusContinue
+		}
+	}
+	if endStream {
+		close(f.bodyCh)
+		f.bodyDone = true
+	}
+	return shared.BodyStatusStopAndBuffer
+}
+
+// OnDestroy is called by Envoy when the stream is destroyed (client disconnect, etc.).
+func (f *handlerFilter) OnDestroy() {
+	if f.cancel != nil {
+		f.cancel()
+	}
+}
+
+// run executes the user handler in a goroutine, then schedules finalization
+// back onto the Envoy worker thread.
+func (f *handlerFilter) run(req *Request) {
+	f.handler(f.ctx, f.rw, req)
+
+	// Schedule finalization on the worker thread.
+	f.scheduler.Schedule(func() {
+		if f.rw.responded {
+			// SendError already scheduled its own SendLocalResponse — nothing to do.
+			return
+		}
+		// Apply queued header mutations.
+		reqHeaders := f.handle.RequestHeaders()
+		for _, m := range f.rw.headerMuts {
+			reqHeaders.Set(m.key, m.value)
+		}
+		// Apply queued metadata mutations.
+		for _, m := range f.rw.metaMuts {
+			f.handle.SetMetadata(m.namespace, m.key, m.value)
+		}
+		f.handle.ContinueRequest()
+	})
+}

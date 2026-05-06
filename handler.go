@@ -1,0 +1,124 @@
+// Package jisr provides a net/http-style API for writing Envoy dynamic module filters.
+// Instead of implementing the raw HttpFilter interface with status enums, goroutine
+// scheduling, and UnsafeEnvoyBuffer discipline, you register a HandlerFunc and write
+// blocking code — jisr handles the event-loop bridge internally.
+package jisr
+
+import (
+	"context"
+	"io"
+	"net/http"
+
+	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
+)
+
+// Header is a copy of the request headers in Go-owned memory.
+// Mutations queue up and are applied on ContinueRequest.
+// Same underlying type as http.Header for familiarity.
+type Header = http.Header
+
+// Request holds the incoming request state visible to a Handler.
+type Request struct {
+	// Header contains the request headers, copied into Go memory.
+	// Mutations are queued and applied when the handler returns.
+	Header Header
+
+	// Body is a blocking io.Reader backed by the Envoy body buffer.
+	// io.ReadAll(r.Body) returns the complete body and blocks until
+	// all chunks have arrived. Not reading Body means chunks are
+	// forwarded without buffering.
+	Body io.Reader
+
+	// FilterName is the Envoy filter name this request matched.
+	FilterName string
+}
+
+// ResponseWriter is the interface through which a Handler sends a response
+// back to the client or mutates the request before forwarding.
+type ResponseWriter interface {
+	// SendError sends an HTTP error response to the downstream client and
+	// terminates the stream. After calling SendError, returning from the
+	// handler is a no-op (ContinueRequest is not called).
+	SendError(statusCode int, body string)
+
+	// SendErrorBytes is like SendError but accepts a pre-encoded byte slice.
+	// Useful when you already have a []byte (e.g. json.Marshal output) and
+	// want to avoid an extra string conversion.
+	SendErrorBytes(statusCode int, body []byte)
+
+	// SetRequestHeader queues a mutation to the request header map that will
+	// be applied before the request is forwarded upstream.
+	SetRequestHeader(key, value string)
+
+	// SetMetadata sets a dynamic metadata value on the stream, applied before
+	// ContinueRequest. namespace is the metadata namespace, key the key.
+	// value must be string, int64, float64, or bool.
+	SetMetadata(namespace, key string, value any)
+}
+
+// HandlerFunc is a function that handles an Envoy HTTP filter event.
+// It is the primary way to use jisr:
+//
+//	jisr.Register("my-filter", jisr.HandlerFunc(func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    apiKey := r.Header.Get("x-api-key")
+//	    if apiKey == "" {
+//	        w.SendError(401, "missing api key")
+//	        return
+//	    }
+//	    // returning without SendError → request is forwarded upstream
+//	}))
+type HandlerFunc func(ctx context.Context, w ResponseWriter, r *Request)
+
+// Middleware wraps a HandlerFunc, returning a new HandlerFunc.
+// Middleware runs in order from outermost to innermost — the first
+// middleware in a Chain call is the first to execute.
+//
+//	func LoggingMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
+//	    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	        log.Printf("request: %s", r.Header.Get(":path"))
+//	        next(ctx, w, r)
+//	    }
+//	}
+type Middleware func(HandlerFunc) HandlerFunc
+
+// Chain applies middleware to a HandlerFunc in declaration order.
+// The first middleware is the outermost wrapper (runs first):
+//
+//	jisr.Chain(handler, logging, auth, rateLimit)
+//	// execution order: logging → auth → rateLimit → handler
+func Chain(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
+	// Apply in reverse so the first middleware is the outermost
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}
+
+// registry maps filter names to HandlerFuncs.
+var registry = map[string]HandlerFunc{}
+
+// Register associates a HandlerFunc with an Envoy filter name.
+// Call Register from an init() function so it runs before the ABI entry point.
+// Panics if the same name is registered twice.
+//
+// Use Chain to apply middleware:
+//
+//	func init() {
+//	    jisr.Register("my-filter", jisr.Chain(myHandler, logging, auth))
+//	}
+func Register(name string, fn HandlerFunc) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	registry[name] = fn
+}
+
+// WellKnownHttpFilterConfigFactories returns the SDK factory map for all registered
+// filters. Pass this to sdk.RegisterHttpFilterConfigFactories in your main package.
+func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFactory {
+	m := make(map[string]shared.HttpFilterConfigFactory, len(registry))
+	for name, fn := range registry {
+		m[name] = &configFactory{name: name, handler: fn}
+	}
+	return m
+}
