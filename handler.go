@@ -15,11 +15,11 @@
 //	func myHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 //	    r.Log(jisr.LogInfo, "handling request: %s", r.Header.Get(":path"))
 //	    if r.Header.Get("x-api-key") == "" {
-//	        w.SendError(http.StatusUnauthorized, `{"error":"missing api key"}`)
+//	        w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
 //	        return
 //	    }
 //	    w.SetRequestHeader("x-user-id", "alice")
-//	    // return without SendError → request forwarded upstream
+//	    // return without Send → request forwarded upstream
 //	}
 //
 // # Building a .so
@@ -116,23 +116,32 @@ func (r *Request) Log(level shared.LogLevel, format string, args ...any) {
 // ResponseWriter is the interface through which a Handler sends a response
 // back to the client or mutates the request before forwarding.
 type ResponseWriter interface {
-	// SendError sends an HTTP error response to the downstream client and
-	// terminates the stream. After calling SendError, returning from the
-	// handler is a no-op (ContinueRequest is not called).
-	SendError(statusCode int, body string)
+	// Send sends a local HTTP response to the downstream client with any
+	// status code and terminates the filter chain — the request is NOT
+	// forwarded upstream. Use this for both success (200) and error responses.
+	//
+	//	w.Send(http.StatusOK, `{"status":"ok"}`)
+	//	w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
+	Send(statusCode int, body string)
 
-	// SendErrorBytes is like SendError but accepts a pre-encoded byte slice.
-	// Useful when you already have a []byte (e.g. json.Marshal output) and
-	// want to avoid an extra string conversion.
-	SendErrorBytes(statusCode int, body []byte)
+	// SendBytes is like Send but accepts a pre-encoded byte slice.
+	// Useful when you already have a []byte (e.g. from json.Marshal).
+	SendBytes(statusCode int, body []byte)
 
 	// SetRequestHeader queues a mutation to the request header map that will
 	// be applied before the request is forwarded upstream.
+	// Has no effect if Send/SendBytes was called.
 	SetRequestHeader(key, value string)
+
+	// SetResponseHeader sets a header on the local response sent by Send/SendBytes.
+	// Must be called before Send/SendBytes. Has no effect if the request is
+	// forwarded upstream (i.e. when Send/SendBytes is never called).
+	SetResponseHeader(key, value string)
 
 	// SetMetadata sets a dynamic metadata value on the stream, applied before
 	// ContinueRequest. namespace is the metadata namespace, key the key.
 	// value must be string, int64, float64, or bool.
+	// Has no effect if Send/SendBytes was called.
 	SetMetadata(namespace, key string, value any)
 }
 

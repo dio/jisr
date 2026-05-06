@@ -70,10 +70,11 @@ type handlerFilter struct {
 // These are applied back on the Envoy worker thread via the Scheduler.
 type responseWriterImpl struct {
 	filter    *handlerFilter
-	responded bool // true if SendError was called
+	responded bool
 
-	headerMuts []headerMutation
-	metaMuts   []metaMutation
+	headerMuts  []headerMutation
+	respHeaders [][2]string
+	metaMuts    []metaMutation
 }
 
 type headerMutation struct{ key, value string }
@@ -82,19 +83,24 @@ type metaMutation struct {
 	value          any
 }
 
-func (w *responseWriterImpl) SendError(statusCode int, body string) {
-	w.sendErrorBytes(statusCode, []byte(body))
+func (w *responseWriterImpl) Send(statusCode int, body string) {
+	w.sendBytes(statusCode, []byte(body))
 }
 
-func (w *responseWriterImpl) SendErrorBytes(statusCode int, body []byte) {
-	w.sendErrorBytes(statusCode, body)
+func (w *responseWriterImpl) SendBytes(statusCode int, body []byte) {
+	w.sendBytes(statusCode, body)
 }
 
-func (w *responseWriterImpl) sendErrorBytes(statusCode int, body []byte) {
+func (w *responseWriterImpl) SetResponseHeader(key, value string) {
+	w.respHeaders = append(w.respHeaders, [2]string{key, value})
+}
+
+func (w *responseWriterImpl) sendBytes(statusCode int, body []byte) {
 	w.responded = true
+	headers := w.respHeaders
 	w.filter.scheduler.Schedule(func() {
 		w.filter.handle.SendLocalResponse(
-			uint32(statusCode), nil, body,
+			uint32(statusCode), headers, body,
 			fmt.Sprintf("jisr-filter:%s", w.filter.name),
 		)
 	})
@@ -147,7 +153,11 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 
 	go f.run(req)
 
-	return shared.HeadersStatusStopAllAndBuffer
+	// HeadersStatusStop (not StopAllAndBuffer) is required so that Envoy
+	// calls OnRequestBody for each arriving chunk. StopAllAndBuffer silently
+	// buffers the body without notifying the filter, which would deadlock
+	// io.ReadAll in the handler goroutine.
+	return shared.HeadersStatusStop
 }
 
 // OnRequestBody is called by Envoy on the worker thread for each body chunk.

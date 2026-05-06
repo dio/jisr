@@ -60,7 +60,7 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o my-filter.so ./cmd
 - `jisr.Register(name, fn)` — register a HandlerFunc for an Envoy filter name
 - `jisr.Chain(handler, middlewares...)` — compose middleware (net/http style)
 - `jisr.Do(ctx, scheduler, handle, cluster, headers, body, timeoutMs)` — blocking Envoy HttpCallout
-- `w.SendError(code, body)` / `w.SendErrorBytes(code, body)` — send local response
+- `w.Send(code, body)` / `w.SendBytes(code, body)` — send local response (any status, no upstream forwarding)
 - `w.SetRequestHeader(key, value)` — mutate request header before forwarding
 - `w.SetMetadata(namespace, key, value)` — set Envoy dynamic metadata
 - `r.Header` — request headers as `http.Header` (Go-owned, safe to use anywhere)

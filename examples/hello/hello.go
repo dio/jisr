@@ -11,6 +11,7 @@ import (
 
 func init() {
 	jisr.Register("hello", jisr.Chain(helloHandler, logMiddleware))
+	jisr.Register("hello-echo", echoHandler)
 }
 
 func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
@@ -20,29 +21,33 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	}
 }
 
+// helloHandler injects x-hello and forwards the request upstream.
 func helloHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	w.SetRequestHeader("x-hello", "from-jisr")
 }
 
-// echoHandler reads the full request body and reflects it back as JSON.
+// echoHandler replies directly without forwarding upstream — no cluster needed.
 func echoHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		r.Log(jisr.LogError, "echoHandler: failed to read body: %v", err)
-		w.SendErrorBytes(http.StatusInternalServerError, jsonErr("failed to read body"))
+		r.Log(jisr.LogError, "echoHandler: read body: %v", err)
+		w.Send(http.StatusInternalServerError, `{"error":"failed to read body"}`)
 		return
+	}
+
+	// Flatten multi-value headers to first-value for simplicity.
+	flat := make(map[string]string, len(r.Header))
+	for k, v := range r.Header {
+		flat[k] = v[0]
 	}
 
 	resp, _ := json.Marshal(map[string]any{
 		"path":    r.Header.Get(":path"),
 		"method":  r.Header.Get(":method"),
 		"body":    string(body),
-		"headers": r.Header,
+		"headers": flat,
 	})
-	w.SendErrorBytes(http.StatusOK, resp)
-}
-
-func jsonErr(msg string) []byte {
-	b, _ := json.Marshal(map[string]string{"error": msg})
-	return b
+	w.SetResponseHeader("content-type", "application/json")
+	// Send 200 directly — no upstream involved.
+	w.SendBytes(http.StatusOK, resp)
 }
