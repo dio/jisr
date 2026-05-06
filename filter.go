@@ -197,8 +197,8 @@ func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) sh
 	return shared.BodyStatusStopAndBuffer
 }
 
-// OnDestroy is called by Envoy when the stream is destroyed (client disconnect, etc.).
-func (f *handlerFilter) OnDestroy() {
+// OnStreamComplete is called by Envoy when the stream is destroyed (client disconnect, etc.).
+func (f *handlerFilter) OnStreamComplete() {
 	if f.cancel != nil {
 		f.cancel()
 	}

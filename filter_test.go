@@ -341,7 +341,7 @@ func TestOnDestroy_CancelsContext(t *testing.T) {
 	})
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
-	h.filter.OnDestroy()
+	h.filter.OnStreamComplete()
 
 	select {
 	case <-ctxDone:
