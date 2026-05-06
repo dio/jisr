@@ -2,7 +2,6 @@ package wsproxy
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"strings"
 
@@ -66,7 +65,7 @@ func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 
 	for _, h := range cfg.StripHeaders {
 		// Use canonical form to match how jisr copies headers.
-		r.Header.Del(http.CanonicalHeaderKey(h))
+		r.Header.Del(h)
 		w.SetRequestHeader(h, "") // signal jisr to remove it
 	}
 
