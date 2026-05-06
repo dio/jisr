@@ -27,6 +27,12 @@ jobs:
           cache-dependency-path: examples/spa/ui/package-lock.json
       - name: build spa ui
         run: cd examples/spa && make ui
+      - name: verify go.mod tidy
+        run: |
+          for d in . server buffer prof e2e examples/hello examples/decoder examples/sse-tap examples/multi-actor examples/ws-proxy examples/spa; do
+            (cd "$d" && GOWORK=off go mod tidy)
+          done
+          git diff --exit-code -- '**go.mod' '**go.sum'
       - name: build jisr
         run: CGO_ENABLED=1 go build ./...
       - name: test jisr
