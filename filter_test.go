@@ -540,3 +540,173 @@ func TestUserHandler_ContextCancellation(t *testing.T) {
 	handler(ctx, w, r)
 	assert.Equal(t, http.StatusServiceUnavailable, w.code)
 }
+
+// ── LimitBody ─────────────────────────────────────────────────────────────────
+
+// TestLimitBody_BodySmallerThanLimit: body fits within limit — all bytes
+// delivered, handler sees the full body, no headDone triggered.
+func TestLimitBody_BodySmallerThanLimit(t *testing.T) {
+	var got []byte
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.LimitBody(8192)
+		got, _ = io.ReadAll(r.Body)
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+	// 100 bytes — well under 8192 limit
+	status := h.body([]byte("hello world -- small body under limit -- padding padding padding padding padding padding paddingg"), true)
+	h.wait(t)
+
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, status)
+	assert.Equal(t, "hello world -- small body under limit -- padding padding padding padding padding padding paddingg", string(got))
+}
+
+// TestLimitBody_BodyLargerThanLimit: body exceeds limit — handler gets exactly
+// n bytes, then EOF. OnRequestBody switches to Continue for the remainder.
+func TestLimitBody_BodyLargerThanLimit(t *testing.T) {
+	const limit = 10
+	var got []byte
+	var bodyBytesRead int
+	limitReached := make(chan struct{})
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.LimitBody(limit)
+		got, _ = io.ReadAll(r.Body)
+		bodyBytesRead = len(got)
+		close(limitReached)
+		<-ctx.Done()
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+
+	// First chunk: 6 bytes — within limit, still buffering
+	s1 := h.body([]byte("hello "), false)
+	// Second chunk: 6 bytes — crosses the 10-byte limit
+	s2 := h.body([]byte("world!"), false)
+
+	// Wait for goroutine to consume past the limit and set headDone.
+	select {
+	case <-limitReached:
+	case <-time.After(time.Second):
+		t.Fatal("limit not reached")
+	}
+
+	// Third chunk: arrives after headDone — must return Continue, not StopAndBuffer
+	s3 := h.body([]byte("TAIL"), true)
+
+	h.filter.OnStreamComplete()
+	h.wait(t)
+
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s1, "before limit: StopAndBuffer")
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s2, "chunk crossing limit: StopAndBuffer")
+	assert.Equal(t, shared.BodyStatusContinue, s3, "after limit: Continue (stream through)")
+	assert.Equal(t, limit, bodyBytesRead, "handler received exactly limit bytes")
+	assert.Equal(t, "hello worl", string(got))
+}
+
+// TestLimitBody_ExactlyAtLimit: body length equals limit exactly.
+// All bytes delivered, then natural EOF — headDone fires at the boundary.
+func TestLimitBody_ExactlyAtLimit(t *testing.T) {
+	const payload = "0123456789" // 10 bytes
+	var got []byte
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.LimitBody(int64(len(payload)))
+		got, _ = io.ReadAll(r.Body)
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+	h.body([]byte(payload), true)
+	h.wait(t)
+
+	assert.Equal(t, payload, string(got))
+}
+
+// TestLimitBody_MultipleChunksBeforeLimit: many small chunks, limit hit
+// mid-stream. Only chunks up to limit are copied into Go memory.
+func TestLimitBody_MultipleChunksBeforeLimit(t *testing.T) {
+	const limit = 5
+	var got []byte
+	limitReached := make(chan struct{})
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.LimitBody(limit)
+		got, _ = io.ReadAll(r.Body)
+		close(limitReached)
+		<-ctx.Done()
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+	s1 := h.body([]byte("AB"), false) // 2 bytes — buffered
+	s2 := h.body([]byte("CD"), false) // 4 bytes total — buffered
+	s3 := h.body([]byte("EF"), false) // 6 bytes — crosses limit at byte 5
+
+	// Wait for goroutine to read past the limit.
+	select {
+	case <-limitReached:
+	case <-time.After(time.Second):
+		t.Fatal("limit not reached")
+	}
+
+	s4 := h.body([]byte("GH"), true) // after limit — stream through
+
+	h.filter.OnStreamComplete()
+	h.wait(t)
+
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s1)
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s2)
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s3)
+	assert.Equal(t, shared.BodyStatusContinue, s4, "tail chunk must stream, not buffer")
+	assert.Equal(t, limit, len(got))
+	assert.Equal(t, "ABCDE", string(got))
+}
+
+// TestLimitBody_NoLimitSet: LimitBody not called — full body delivered as before.
+func TestLimitBody_NoLimitSet(t *testing.T) {
+	var got []byte
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		got, _ = io.ReadAll(r.Body)
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+	h.body([]byte("full body no limit"), true)
+	h.wait(t)
+
+	assert.Equal(t, "full body no limit", string(got))
+}
+
+// TestLimitBody_OnRequestBodyReturnsCorrectStatus verifies the status sequence:
+// StopAndBuffer while buffering, Continue once headDone is set.
+func TestLimitBody_StatusTransition(t *testing.T) {
+	ready := make(chan struct{})
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.LimitBody(4)
+		io.ReadAll(r.Body)
+		close(ready)
+		// Hold goroutine open so we can observe subsequent body statuses.
+		<-ctx.Done()
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, false)
+	s1 := h.body([]byte("AB"), false)
+	s2 := h.body([]byte("CD"), false) // hits limit exactly at 4
+
+	// Wait for handler to read the limit and signal headDone.
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not reach limit")
+	}
+
+	s3 := h.body([]byte("EF"), false) // after headDone — must Continue
+	s4 := h.body([]byte("GH"), true)  // final chunk — must Continue
+
+	h.filter.OnStreamComplete()
+	h.wait(t)
+
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s1)
+	assert.Equal(t, shared.BodyStatusStopAndBuffer, s2)
+	assert.Equal(t, shared.BodyStatusContinue, s3)
+	assert.Equal(t, shared.BodyStatusContinue, s4)
+}

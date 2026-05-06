@@ -50,7 +50,7 @@
 // returns HeadersStatusStop to suspend the Envoy filter chain. Body chunks pushed
 // by OnRequestBody are forwarded into the channel. When the handler returns,
 // [Scheduler.Schedule] hops back onto the Envoy worker thread to apply mutations
-// and call ContinueRequest. Client disconnects cancel the context via OnDestroy.
+// Client disconnects cancel the context via OnStreamComplete.
 //
 // See https://github.com/dio/jisr/tree/main/examples/hello for a runnable example.
 package jisr
@@ -94,8 +94,9 @@ type Request struct {
 	FilterName string
 
 	// internal — wired by the filter bridge
-	log      func(level shared.LogLevel, format string, args ...any)
-	skipBody func()
+	log       func(level shared.LogLevel, format string, args ...any)
+	skipBody  func()
+	limitBody func(n int64)
 }
 
 // SkipBody signals jisr that this handler will not read the request body.
@@ -116,6 +117,30 @@ type Request struct {
 func (r *Request) SkipBody() {
 	if r.skipBody != nil {
 		r.skipBody()
+	}
+}
+
+// LimitBody caps r.Body at n bytes. After n bytes have been delivered, r.Body
+// returns EOF and any subsequent request body chunks stream directly to upstream
+// without being copied into Go memory.
+//
+// Use when you only need to inspect the beginning of a large body — for example,
+// reading a JSON model field from an LLM request while streaming the full body
+// to the upstream provider:
+//
+//	r.LimitBody(8192)
+//	head, _ := io.ReadAll(r.Body)  // at most 8192 bytes, then EOF
+//	var req struct{ Model string `json:"model"` }
+//	json.Unmarshal(head, &req)
+//	// remainder of body streams to upstream without Go copies
+//
+// If the body is shorter than n, all bytes are delivered normally —
+// LimitBody has no effect on small bodies.
+//
+// Must be called before reading r.Body. Mutually exclusive with SkipBody.
+func (r *Request) LimitBody(n int64) {
+	if n > 0 && r.limitBody != nil {
+		r.limitBody(n)
 	}
 }
 

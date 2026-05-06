@@ -9,9 +9,12 @@ import (
 // into a blocking stream. OnRequestBody pushes chunks in; Read blocks until
 // a chunk arrives or the channel is closed (EOF).
 type bodyReader struct {
-	ch  chan []byte // receives copied chunks from OnRequestBody
-	buf *bytes.Buffer
-	eof bool
+	ch      chan []byte
+	buf     *bytes.Buffer
+	eof     bool
+	limit   int64    // 0 = unlimited
+	read    int64    // bytes delivered to caller so far
+	onLimit func()   // called exactly once when read >= limit
 }
 
 func newBodyReader() (*bodyReader, chan<- []byte) {
@@ -19,12 +22,47 @@ func newBodyReader() (*bodyReader, chan<- []byte) {
 	return &bodyReader{ch: ch, buf: &bytes.Buffer{}}, ch
 }
 
+// setLimit configures a read cap. Once n bytes have been delivered to the
+// caller, Read returns EOF and onLimit is invoked (once, from the Read call
+// that crosses the threshold). Must be called before the first Read.
+func (b *bodyReader) setLimit(n int64, onLimit func()) {
+	b.limit = n
+	b.onLimit = onLimit
+}
+
 // Read implements io.Reader. Blocks until data is available or EOF.
 func (b *bodyReader) Read(p []byte) (int, error) {
 	for {
 		// Drain the internal buffer first.
 		if b.buf.Len() > 0 {
-			return b.buf.Read(p)
+			// Respect the limit: only deliver up to limit-read bytes.
+			if b.limit > 0 {
+				remaining := b.limit - b.read
+				if remaining <= 0 {
+					b.eof = true
+					if b.onLimit != nil {
+						fn := b.onLimit
+						b.onLimit = nil
+						fn()
+					}
+					return 0, io.EOF
+				}
+				if int64(len(p)) > remaining {
+					p = p[:remaining]
+				}
+			}
+			n, err := b.buf.Read(p)
+			b.read += int64(n)
+			if b.limit > 0 && b.read >= b.limit {
+				b.eof = true
+				if b.onLimit != nil {
+					fn := b.onLimit
+					b.onLimit = nil
+					fn()
+				}
+				return n, io.EOF
+			}
+			return n, err
 		}
 		if b.eof {
 			return 0, io.EOF

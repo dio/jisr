@@ -61,8 +61,9 @@ type handlerFilter struct {
 	// body pipeline
 	bodyCh     chan<- []byte
 	bodyReader *bodyReader
-	bodyDone   bool       // true once endStream seen in OnRequestBody
+	bodyDone   bool        // true once endStream seen in OnRequestBody
 	bodySkip   atomic.Bool // true after r.SkipBody() — passthrough mode
+	headDone   atomic.Bool // true after r.LimitBody() threshold reached — stream remainder
 
 	// response writer state (accumulated on goroutine, flushed via scheduler)
 	rw *responseWriterImpl
@@ -157,6 +158,17 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 				close(bodyCh)
 			}
 		},
+		limitBody: func(n int64) {
+			f.bodyReader.setLimit(n, func() {
+				// Called from the handler goroutine when the limit is reached.
+				// Signal OnRequestBody to stop buffering and stream the rest.
+				f.headDone.Store(true)
+				// Close the channel so the handler's io.ReadAll returns.
+				if !f.bodyDone && !f.bodySkip.Load() {
+					close(bodyCh)
+				}
+			})
+		},
 	}
 	f.rw = &responseWriterImpl{filter: f}
 
@@ -174,8 +186,9 @@ func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) sh
 	if f.bodyDone {
 		return shared.BodyStatusContinue
 	}
-	// If SkipBody was called, pass chunks through without buffering.
-	if f.bodySkip.Load() {
+	// If SkipBody or LimitBody threshold was reached, stream chunks through
+	// without copying into Go memory.
+	if f.bodySkip.Load() || f.headDone.Load() {
 		if endStream {
 			f.bodyDone = true
 		}
