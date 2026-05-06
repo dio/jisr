@@ -124,10 +124,10 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 
 	// Copy all headers into Go-owned memory (no UnsafeEnvoyBuffer leaking).
-	// Use http.CanonicalHeaderKey so r.Header.Get works with any casing.
+	// http.Header.Add calls CanonicalHeaderKey internally.
 	h := make(http.Header)
 	for _, kv := range headers.GetAll() {
-		h.Add(http.CanonicalHeaderKey(kv[0].ToString()), kv[1].ToString())
+		h.Add(kv[0].ToString(), kv[1].ToString())
 	}
 
 	// Set up body pipeline.
