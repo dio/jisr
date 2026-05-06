@@ -9,27 +9,80 @@ import (
 	"github.com/dio/jisr"
 )
 
+// Metrics defined once at config time, incremented per-request.
+var (
+	requestsTotal jisr.MetricID
+	echoTotal     jisr.MetricID
+)
+
 func init() {
-	jisr.Register("hello", jisr.Chain(helloHandler, logMiddleware))
-	jisr.Register("hello-echo", echoHandler)
+	jisr.RegisterWithConfig("hello",
+		func(h jisr.ConfigHandle) error {
+			var err error
+			requestsTotal, err = h.DefineCounter("hello_requests_total")
+			return err
+		},
+		jisr.Chain(helloHandler, logMiddleware),
+	)
+
+	jisr.RegisterWithConfig("hello-echo",
+		func(h jisr.ConfigHandle) error {
+			var err error
+			echoTotal, err = h.DefineCounter("hello_echo_total")
+			return err
+		},
+		echoHandler,
+	)
+
+	// Response-phase filters.
+	jisr.RegisterWithResponse("resp-stamp", skipBodyHandler, respStampHandler, jisr.ResponseModePassthrough)
+	jisr.RegisterWithResponse("resp-tap", skipBodyHandler, respTapHandler, jisr.ResponseModeObserve)
 }
 
 func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-		r.Log(jisr.LogInfo, "[%s] %s %s", r.FilterName, r.Header.Get(":method"), r.Header.Get(":path"))
+		// Use GetAttr for path and method: snapshotted on the worker thread,
+		// more direct than parsing pseudo-headers.
+		method := r.GetAttr(jisr.AttrRequestMethod)
+		path := r.GetAttr(jisr.AttrRequestPath)
+		r.Log(jisr.LogInfo, "[%s] %s %s", r.FilterName, method, path)
 		next(ctx, w, r)
 	}
 }
 
 // helloHandler injects x-hello and forwards the request upstream.
 // SkipBody is called because this filter only touches headers.
-func helloHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+func helloHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	r.SkipBody()
 	w.SetRequestHeader("x-hello", "from-jisr")
+	w.IncrementCounter(requestsTotal, 1)
 }
 
-// echoHandler replies directly without forwarding upstream — no cluster needed.
-func echoHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+// skipBodyHandler is the request phase for response-phase filters.
+// They only care about the response; skip the request body.
+// Also injects x-jisr-filter to prove the request phase ran.
+func skipBodyHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+	r.SkipBody()
+	w.SetRequestHeader("x-jisr-filter", r.FilterName)
+}
+
+// respStampHandler inspects the upstream response status in Passthrough mode.
+// ResponseModePassthrough: zero body overhead, r.Body is nil.
+func respStampHandler(_ context.Context, _ jisr.ResponseWriter, r *jisr.Response) {
+	_ = r.StatusCode
+	_ = r.Header.Get("content-type")
+}
+
+// respTapHandler counts upstream response body bytes in Observe mode.
+// ResponseModeObserve: body streams to downstream simultaneously.
+func respTapHandler(_ context.Context, _ jisr.ResponseWriter, r *jisr.Response) {
+	// io.Copy returns when the body channel is closed (eos) or ctx is cancelled
+	// (client/upstream disconnect). Both cases exit cleanly.
+	io.Copy(io.Discard, r.Body) //nolint:errcheck
+}
+
+// echoHandler replies directly without forwarding upstream.
+func echoHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		r.Log(jisr.LogError, "echoHandler: read body: %v", err)
@@ -37,19 +90,18 @@ func echoHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 		return
 	}
 
-	// Flatten multi-value headers to first-value for simplicity.
 	flat := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
 		flat[k] = v[0]
 	}
 
 	resp, _ := json.Marshal(map[string]any{
-		"path":    r.Header.Get(":path"),
-		"method":  r.Header.Get(":method"),
+		"path":    r.GetAttr(jisr.AttrRequestPath),
+		"method":  r.GetAttr(jisr.AttrRequestMethod),
 		"body":    string(body),
 		"headers": flat,
 	})
 	w.SetResponseHeader("content-type", "application/json")
-	// Send 200 directly — no upstream involved.
 	w.SendBytes(http.StatusOK, resp)
+	w.IncrementCounter(echoTotal, 1)
 }

@@ -37,7 +37,8 @@ func (cb *calloutCallback) OnHttpCalloutDone(
 		return
 	}
 
-	// Copy response headers into Go memory.
+	// Copy response headers into Go memory using canonical keys
+	// so resp.Header.Get() works with any casing, consistent with jisr.Request.Header.
 	h := make(http.Header, len(headers))
 	var status int
 	for _, kv := range headers {
@@ -47,7 +48,7 @@ func (cb *calloutCallback) OnHttpCalloutDone(
 			fmt.Sscanf(v, "%d", &status)
 			continue
 		}
-		h[k] = append(h[k], v)
+		h.Add(k, v)
 	}
 
 	// Assemble body.
@@ -72,7 +73,7 @@ func (cb *calloutCallback) OnHttpCalloutDone(
 //
 // Do uses Envoy's native HttpCallout (connection pooling, retries, circuit
 // breaking from cluster config) while presenting a blocking call to the handler.
-// It respects ctx cancellation — if the context is cancelled, Do returns
+// It respects ctx cancellation. If the context is cancelled, Do returns
 // context.Canceled immediately.
 func Do(
 	ctx context.Context,

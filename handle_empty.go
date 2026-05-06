@@ -102,3 +102,19 @@ func (EmptyHttpFilterHandle) DecrementGaugeValue(shared.MetricID, uint64, ...str
 func (EmptyHttpFilterHandle) IncrementCounterValue(shared.MetricID, uint64, ...string) shared.MetricsResult {
 	return shared.MetricsSuccess
 }
+
+// EmptyHttpFilterConfigHandle is a no-op implementation of shared.HttpFilterConfigHandle.
+// Use in tests to exercise ConfigFunc and configHandleImpl without a live Envoy instance.
+type EmptyHttpFilterConfigHandle struct{}
+
+func (EmptyHttpFilterConfigHandle) Log(_ shared.LogLevel, _ string, _ ...any) {}
+func (EmptyHttpFilterConfigHandle) DefineCounter(_ string, _ ...string) (shared.MetricID, shared.MetricsResult) {
+	return 0, shared.MetricsSuccess
+}
+func (EmptyHttpFilterConfigHandle) DefineHistogram(_ string, _ ...string) (shared.MetricID, shared.MetricsResult) {
+	return 0, shared.MetricsSuccess
+}
+func (EmptyHttpFilterConfigHandle) DefineGauge(_ string, _ ...string) (shared.MetricID, shared.MetricsResult) {
+	return 0, shared.MetricsSuccess
+}
+func (EmptyHttpFilterConfigHandle) GetScheduler() shared.Scheduler { return nil }
