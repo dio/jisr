@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
 )
@@ -60,7 +61,8 @@ type handlerFilter struct {
 	// body pipeline
 	bodyCh     chan<- []byte
 	bodyReader *bodyReader
-	bodyDone   bool // true once endStream seen in OnRequestBody
+	bodyDone   bool       // true once endStream seen in OnRequestBody
+	bodySkip   atomic.Bool // true after r.SkipBody() — passthrough mode
 
 	// response writer state (accumulated on goroutine, flushed via scheduler)
 	rw *responseWriterImpl
@@ -121,9 +123,10 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 
 	// Copy all headers into Go-owned memory (no UnsafeEnvoyBuffer leaking).
+	// Use http.CanonicalHeaderKey so r.Header.Get works with any casing.
 	h := make(http.Header)
 	for _, kv := range headers.GetAll() {
-		k := kv[0].ToString()
+		k := http.CanonicalHeaderKey(kv[0].ToString())
 		v := kv[1].ToString()
 		h[k] = append(h[k], v)
 	}
@@ -144,9 +147,15 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 		Body:       f.bodyReader,
 		FilterName: f.name,
 		log: func(level shared.LogLevel, format string, args ...any) {
-			// handle.Log is thread-safe in the Envoy SDK — it routes
-			// through Envoy's spdlog which is designed for multi-thread use.
+			// handle.Log is thread-safe in the Envoy SDK.
 			f.handle.Log(level, format, args...)
+		},
+		skipBody: func() {
+			// CAS prevents double-close. Also check bodyDone — if endStream
+			// was true on headers, bodyCh is already closed.
+			if !f.bodyDone && f.bodySkip.CompareAndSwap(false, true) {
+				close(bodyCh)
+			}
 		},
 	}
 	f.rw = &responseWriterImpl{filter: f}
@@ -163,6 +172,13 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 // OnRequestBody is called by Envoy on the worker thread for each body chunk.
 func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) shared.BodyStatus {
 	if f.bodyDone {
+		return shared.BodyStatusContinue
+	}
+	// If SkipBody was called, pass chunks through without buffering.
+	if f.bodySkip.Load() {
+		if endStream {
+			f.bodyDone = true
+		}
 		return shared.BodyStatusContinue
 	}
 	// Push copied chunks into the body channel for the goroutine to consume.
@@ -196,7 +212,6 @@ func (f *handlerFilter) run(req *Request) {
 	// Schedule finalization on the worker thread.
 	f.scheduler.Schedule(func() {
 		if f.rw.responded {
-			// SendError already scheduled its own SendLocalResponse — nothing to do.
 			return
 		}
 		// Apply queued header mutations.
