@@ -14,7 +14,7 @@
 //
 //	func myHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 //	    if r.Header.Get("x-api-key") == "" {
-//	        w.SendError(401, `{"error":"missing api key"}`)
+//	        w.SendError(http.StatusUnauthorized, `{"error":"missing api key"}`)
 //	        return
 //	    }
 //	    w.SetRequestHeader("x-user-id", "alice")
