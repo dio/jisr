@@ -203,7 +203,7 @@ a cluster. But the header must be set before the route is evaluated. If a filter
 sets `x-cluster` after route selection has already run, the cluster is ignored.
 
 `ClearRouteCache()` tells Envoy to discard the current route evaluation and
-re-run it with the current header values. This is how zia-decoder routes LLM
+re-run it with the current header values. This is how an LLM router routes
 requests: read the `model` field from the request body, map it to a provider
 cluster name, set `x-cluster`, then call `ClearRouteCache`. Envoy picks the
 right upstream on the re-evaluation.

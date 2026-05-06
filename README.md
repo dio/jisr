@@ -156,14 +156,14 @@ var (
 )
 
 func init() {
-    jisr.RegisterWithConfigAndResponse("zia-decoder",
+    jisr.RegisterWithConfigAndResponse("llm-router",
         func(h jisr.ConfigHandle) error {
             var err error
-            requestsTotal, err = h.DefineCounter("zia_requests_total", "cluster")
+            requestsTotal, err = h.DefineCounter("router_requests_total", "cluster")
             if err != nil {
                 return err
             }
-            ttftMs, err = h.DefineHistogram("zia_ttft_ms", "cluster")
+            ttftMs, err = h.DefineHistogram("router_ttft_ms", "cluster")
             return err
         },
         decoderRequest,
@@ -181,7 +181,7 @@ func decoderRequest(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 
     cluster := resolveCluster(req.Model)
     w.SetRequestHeader("x-cluster", cluster)
-    w.SetMetadata("zia", "cluster", cluster)
+    w.SetMetadata("router", "cluster", cluster)
     w.ClearRouteCache() // re-evaluate cluster_header route with new x-cluster value
     w.IncrementCounter(requestsTotal, 1, cluster)
 }
@@ -192,7 +192,7 @@ func decoderResponse(_ context.Context, w jisr.ResponseWriter, r *jisr.Response)
 }
 ```
 
-See [examples/decoder](examples/decoder) for the full zia-decoder style example.
+See [examples/decoder](examples/decoder) for the full runnable example.
 
 ## API reference
 
