@@ -9,5 +9,6 @@ use (
 	./examples/spa
 	./examples/sse-tap
 	./examples/ws-proxy
+	./prof
 	./server
 )
