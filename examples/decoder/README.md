@@ -47,6 +47,25 @@ make
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libdecoder.so ./cmd
 ```
 
+## Run
+
+```sh
+# start Envoy (no backend needed — all requests are forwarded to real providers)
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+
+# route to OpenAI
+curl http://localhost:10000/v1/chat/completions \
+  -H "authorization: Bearer $OPENAI_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
+
+# route to Anthropic (model prefix "claude-" → anthropic cluster)
+curl http://localhost:10000/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-haiku-3-5","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}'
+```
+
 ## What this demonstrates
 
 - `RegisterWithConfigAndResponse` — config setup, request handler, response handler, and mode in one call

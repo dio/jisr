@@ -42,6 +42,24 @@ make
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libws-proxy.so ./cmd
 ```
 
+## Run
+
+```sh
+# set your OpenAI API key
+export OPENAI_API_KEY=sk-...
+
+# start Envoy
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+# stderr: ws-proxy: listening on 127.0.0.1:XXXXX
+# (update ws-proxy-local cluster port in envoy.yaml if needed)
+
+# normal HTTP — passes through to upstream
+curl http://localhost:10000/v1/models -H "authorization: Bearer $OPENAI_API_KEY"
+
+# WebSocket upgrade — proxied through the embedded WS server to OpenAI
+# (use a WebSocket client that supports the Realtime API protocol)
+```
+
 ## What this demonstrates
 
 - `RegisterRaw` for filters that need full HTTP upgrade control

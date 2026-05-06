@@ -25,20 +25,20 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libhello.so ./cmd
 ## Run
 
 ```sh
-# start a backend on port 8080 (any HTTP server)
+# start a backend on port 8080
 python3 -m http.server 8080
 
 # start Envoy
 ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
 
-# hello filter: injects x-hello header
-curl http://localhost:10000/
+# hello filter (port 10000): injects x-hello header
+curl -v http://localhost:10000/
 
-# hello-echo: direct response, no upstream
-curl -X POST http://localhost:10001/ping -d '{"hello":"world"}' -H content-type:application/json
-
-# resp-rewrite: JSON body gets x_jisr_rewritten injected
-curl http://localhost:10000/
+# hello-echo (port 10001): direct JSON response, no upstream
+curl -X POST http://localhost:10001/ping \
+  -H "content-type: application/json" \
+  -H "x-request-id: abc123" \
+  -d '{"hello":"world"}'
 ```
 
 ## Admin server

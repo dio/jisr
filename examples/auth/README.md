@@ -70,6 +70,25 @@ make
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libauth.so ./cmd
 ```
 
+## Run
+
+```sh
+# start a backend on port 8080
+python3 -m http.server 8080
+
+# start Envoy
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+
+# port 10000 — admin keys only
+curl -H "x-api-key: key-admin" http://localhost:10000/
+curl -H "x-api-key: key-readonly" http://localhost:10000/
+curl -H "x-api-key: key-public" http://localhost:10000/   # 401 — not in admin list
+
+# port 10001 — public keys only
+curl -H "x-api-key: key-public" http://localhost:10001/
+curl -H "x-api-key: key-admin" http://localhost:10001/    # 401 — not in public list
+```
+
 ## Tests
 
 The struct-based pattern makes tests straightforward — no global state, no Envoy:

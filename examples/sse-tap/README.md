@@ -42,6 +42,21 @@ make
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libsse-tap.so ./cmd
 ```
 
+## Run
+
+```sh
+# start Envoy pointing at an LLM backend that returns SSE
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+
+# send a streaming request — token counts appear in Envoy metrics
+curl -N http://localhost:10000/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+
+# check metrics
+curl -s http://localhost:9901/stats | grep sse_tap
+```
+
 ## What this demonstrates
 
 - `RegisterWithConfigAndResponse` with `ResponseModeObserve`

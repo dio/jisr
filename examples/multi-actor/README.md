@@ -35,6 +35,29 @@ make
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmulti-actor.so ./cmd
 ```
 
+## Run
+
+```sh
+# start a backend on port 8080
+python3 -m http.server 8080
+
+# start Envoy — watch for the port the HTTP actor binds
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+# stderr: multi-actor: HTTP actor listening on 127.0.0.1:XXXXX
+# stderr: multi-actor: probe actor listening on 127.0.0.1:YYYYY
+
+# update envoy.yaml http-actor cluster port, then restart Envoy, then:
+
+# HTTP traffic forwarded to backend
+curl http://localhost:10000/
+
+# /status served by the HTTP actor inside the .so
+curl http://localhost:10000/status
+
+# ping/pong raw TCP probe (replace YYYYY with the probe port from logs)
+echo "ping" | nc 127.0.0.1 YYYYY   # → pong
+```
+
 ## What this demonstrates
 
 - `jisr/server.Group` for managing multiple background actors with a unified lifecycle

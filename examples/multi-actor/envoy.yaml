@@ -1,0 +1,70 @@
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    # Port 10000 — multi-actor filter (pass-through for HTTP traffic).
+    # The filter itself is a no-op on the request path — it just ensures the
+    # three background actors (HTTP server, goroutine, TCP probe) are running.
+    #
+    # The HTTP actor inside the .so binds a random port at startup and logs it:
+    #   multi-actor: HTTP actor listening on 127.0.0.1:XXXXX
+    #
+    # Update the port_value in the http-actor cluster below to match.
+    # In production, write the port to a file and read it into the config
+    # via Envoy's config discovery service or a bootstrap extension.
+    - name: main
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                http_filters:
+                  - name: multi-actor
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: multi-actor
+                      filter_name: multi-actor
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: main
+                  virtual_hosts:
+                    - name: services
+                      domains: ["*"]
+                      routes:
+                        # /status — served by the HTTP actor inside the .so.
+                        # All other paths forwarded to the real backend.
+                        - match: { path: "/status" }
+                          route: { cluster: http-actor }
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+
+  clusters:
+    # HTTP actor running inside the .so.
+    # Port is random — update port_value after reading the startup log.
+    - name: http-actor
+      type: STATIC
+      load_assignment:
+        cluster_name: http-actor
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 19000 }
+
+    - name: backend
+      type: STATIC
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }

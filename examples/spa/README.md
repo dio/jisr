@@ -29,12 +29,20 @@ then renders the correct component client-side.
 ## Build
 
 ```sh
-# Full build: installs npm deps, runs vite build, compiles .so
+# Full build: install npm deps, run vite build, compile .so
 make
 
 # Or step by step:
 make ui        # npm install (if needed) + vite build
 make build-so  # compile the .so only (ui/dist must already exist)
+```
+
+## Run
+
+```sh
+make          # build ui + .so
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+# open http://localhost:10000
 ```
 
 Requires Node.js ≥ 18 and Go with CGO enabled.
