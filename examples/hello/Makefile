@@ -15,7 +15,6 @@ clean:
 	rm -f $(OUTPUT) $(OUTPUT:.so=.h)
 
 tidy:
-	$(GOCMD) mod tidy
 
 # Start a JSON echo backend that reflects all received headers.
 # Needed to verify jisr injects x-hello into the upstream request.

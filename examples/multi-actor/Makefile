@@ -12,4 +12,3 @@ clean:
 	rm -f $(OUTPUT) $(OUTPUT:.so=.h)
 
 tidy:
-	$(GOCMD) mod tidy
