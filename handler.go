@@ -123,6 +123,8 @@ type ConfigFunc func(h ConfigHandle) error
 
 // Attr re-exports the SDK AttributeID constants for use with r.GetAttr.
 // These map directly to Envoy stream attributes, snapshotted in OnRequestHeaders.
+// Only string-typed attributes are included; numeric ones (Size, Duration) are
+// not supported by GetAttributeString in Envoy 1.37.1.
 const (
 	AttrRequestPath      = shared.AttributeIDRequestPath
 	AttrRequestMethod    = shared.AttributeIDRequestMethod
@@ -132,7 +134,6 @@ const (
 	AttrRequestProtocol  = shared.AttributeIDRequestProtocol
 	AttrRequestID        = shared.AttributeIDRequestId
 	AttrRequestUserAgent = shared.AttributeIDRequestUserAgent
-	AttrRequestSize      = shared.AttributeIDRequestSize
 )
 
 

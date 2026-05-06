@@ -223,7 +223,6 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 		shared.AttributeIDRequestProtocol,
 		shared.AttributeIDRequestId,
 		shared.AttributeIDRequestUserAgent,
-		shared.AttributeIDRequestSize,
 	}
 	attrs := make(map[shared.AttributeID]string, len(attrIDs))
 	for _, id := range attrIDs {
