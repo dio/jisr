@@ -25,10 +25,11 @@ const (
 )
 
 var (
-	projectRoot string
-	envoyCmd    *exec.Cmd
-	echoServer  *http.Server
-	resetPort   int // TCP port that accepts then immediately RSTs — upstream reset-before-connect
+	projectRoot  string
+	envoyCmd     *exec.Cmd
+	echoServer   *http.Server
+	resetPort    int    // TCP port that accepts then immediately RSTs — upstream reset-before-connect
+	adminPortStr string // "http://127.0.0.1:<port>" of the jisr/prof admin server inside the .so
 )
 
 func TestMain(m *testing.M) {
@@ -58,6 +59,15 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: build OK")
 	}
 
+	// 4a. Temp file for the admin server port — written by the .so on init.
+	portFile, err := os.CreateTemp("", "jisr-admin-port-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: failed to create port file: %v\n", err)
+		os.Exit(1)
+	}
+	portFile.Close()
+	defer os.Remove(portFile.Name())
+
 	// 4. Start Envoy with a generated config.
 	envoyBin := os.Getenv("ENVOY_BIN")
 	if envoyBin == "" {
@@ -72,6 +82,7 @@ func TestMain(m *testing.M) {
 	envoyCmd.Env = append(os.Environ(),
 		"GODEBUG=cgocheck=0",
 		"ENVOY_DYNAMIC_MODULES_SEARCH_PATH="+projectRoot,
+		"JISR_ADMIN_PORT_FILE="+portFile.Name(),
 	)
 	envoyCmd.Stdout = os.Stderr
 	envoyCmd.Stderr = os.Stderr
@@ -87,6 +98,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	fmt.Fprintln(os.Stderr, "e2e: envoy ready")
+
+	// Read admin port written by the .so on init.
+	if raw, err := os.ReadFile(portFile.Name()); err == nil && len(raw) > 0 {
+		adminPortStr = "http://127.0.0.1:" + string(raw)
+		fmt.Fprintf(os.Stderr, "e2e: jisr admin server at %s\n", adminPortStr)
+	} else {
+		fmt.Fprintln(os.Stderr, "e2e: WARNING: admin port file empty — prof e2e tests will skip")
+	}
 
 	code := m.Run()
 

@@ -6,3 +6,8 @@ require (
 	github.com/dio/jisr v0.9.0
 	github.com/envoyproxy/envoy/source/extensions/dynamic_modules v0.0.0-20260311012303-5ef4e4cea57f
 )
+
+require (
+	github.com/dio/jisr/prof v0.2.0 // indirect
+	github.com/dio/jisr/server v0.6.0 // indirect
+)
