@@ -2,6 +2,7 @@ package jisr_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,23 +15,59 @@ import (
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared/fake"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 // ── fakeHandle ────────────────────────────────────────────────────────────────
 
 type fakeHandle struct {
 	jisr.EmptyHttpFilterHandle
 
-	mu              sync.Mutex
-	reqHeaders      *fake.FakeHeaderMap
+	mu               sync.Mutex
+	reqHeaders       *fake.FakeHeaderMap
 	upstreamRespHdrs *fake.FakeHeaderMap // response headers from upstream
-	metadata        map[string]any
-	localResp       *localResponse
-	respHeaders     []responseHeaderSent
-	respData        []responseDataSent
-	continued       bool
-	continuedResp   bool
-	scheduler       *fakeScheduler
+	respBodyBuf      *fakeBodyBuffer     // mutable response body buffer (for ReplaceBody)
+	metadata         map[string]any
+	localResp        *localResponse
+	respHeaders      []responseHeaderSent
+	respData         []responseDataSent
+	continued        bool
+	continuedResp    bool
+	scheduler        shared.Scheduler
+	logFn            func(shared.LogLevel, string) // optional log capture
+}
+
+type fakeBodyBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *fakeBodyBuffer) GetChunks() []shared.UnsafeEnvoyBuffer { return nil }
+func (b *fakeBodyBuffer) GetSize() uint64 {
+	b.mu.Lock(); defer b.mu.Unlock()
+	return uint64(len(b.data))
+}
+func (b *fakeBodyBuffer) Drain(n uint64) {
+	b.mu.Lock(); defer b.mu.Unlock()
+	if n >= uint64(len(b.data)) {
+		b.data = nil
+	} else {
+		b.data = b.data[n:]
+	}
+}
+func (b *fakeBodyBuffer) Append(data []byte) {
+	b.mu.Lock(); defer b.mu.Unlock()
+	b.data = append(b.data, data...)
+}
+func (b *fakeBodyBuffer) Bytes() []byte {
+	b.mu.Lock(); defer b.mu.Unlock()
+	out := make([]byte, len(b.data))
+	copy(out, b.data)
+	return out
 }
 
 type localResponse struct {
@@ -102,6 +139,15 @@ func (h *fakeHandle) ContinueResponse() {
 	h.continuedResp = true
 }
 
+func (h *fakeHandle) BufferedResponseBody() shared.BodyBuffer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.respBodyBuf == nil {
+		h.respBodyBuf = &fakeBodyBuffer{}
+	}
+	return h.respBodyBuf
+}
+
 func (h *fakeHandle) ResponseHeaders() shared.HeaderMap {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -111,7 +157,11 @@ func (h *fakeHandle) ResponseHeaders() shared.HeaderMap {
 	return h.upstreamRespHdrs
 }
 
-func (h *fakeHandle) Log(_ shared.LogLevel, _ string, _ ...any) {}
+func (h *fakeHandle) Log(level shared.LogLevel, format string, args ...any) {
+	if h.logFn != nil {
+		h.logFn(level, fmt.Sprintf(format, args...))
+	}
+}
 
 // fakeScheduler runs scheduled functions synchronously in tests.
 type fakeScheduler struct {
@@ -979,5 +1029,227 @@ func TestResponse_ContextCancelledOnStreamComplete(t *testing.T) {
 	case <-respDone:
 	case <-time.After(time.Second):
 		t.Fatal("response handler did not unblock after OnStreamComplete")
+	}
+}
+
+// ── Goroutine leak tests ───────────────────────────────────────────────────────
+// goleak.VerifyTestMain catches leaks at process exit, but these tests also
+// explicitly verify the goroutine exits within a bounded deadline.
+
+// TestLeak_SendDirectResponse_WithRespHandler verifies that when a request
+// handler calls w.Send() (direct response), the goroutine does NOT park on
+// respHeadersCh forever. Envoy never calls OnResponseHeaders for locally-terminated
+// requests — the goroutine must skip the response phase and exit.
+func TestLeak_SendDirectResponse_WithRespHandler(t *testing.T) {
+	goroutineExited := make(chan struct{})
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+			r.SkipBody()
+			w.Send(http.StatusForbidden, `{"error":"forbidden"}`)
+		},
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			// This must NEVER be called — the request was locally terminated.
+			t.Error("ResponseFunc must not be called when request handler calls w.Send()")
+		},
+		jisr.ResponseModePassthrough,
+	)
+
+	// Patch: detect goroutine exit via scheduler (it calls ContinueRequest or nothing).
+	// We track via the continued flag — but actually the goroutine exits without
+	// ContinueRequest because responded=true. Track via a separate channel.
+	// We replace the scheduler to detect when the goroutine's deferred Schedule fires.
+	origScheduler := h.handle.scheduler
+	h.handle.scheduler = &detectingScheduler{
+		inner: origScheduler,
+		onSchedule: func() {
+			select {
+			case goroutineExited <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+
+	// The goroutine must exit promptly — it must not block on respHeadersCh.
+	select {
+	case <-goroutineExited:
+		// Good — goroutine scheduled something (the no-op ContinueRequest guard).
+	case <-time.After(time.Second):
+		t.Fatal("goroutine leaked: did not exit after w.Send() + respHandler")
+	}
+
+	// Envoy never called OnResponseHeaders — assert no response phase ran.
+	h.handle.mu.Lock()
+	assert.False(t, h.handle.continuedResp, "ContinueResponse must not be called for direct responses")
+	h.handle.mu.Unlock()
+}
+
+// detectingScheduler wraps a fakeScheduler and calls onSchedule on each Schedule().
+type detectingScheduler struct {
+	inner      shared.Scheduler
+	onSchedule func()
+}
+
+func (s *detectingScheduler) Schedule(fn func()) {
+	s.inner.Schedule(fn)
+	if s.onSchedule != nil {
+		s.onSchedule()
+	}
+}
+
+// TestLeak_HandlerPanic_DoesNotHang verifies that a panicking request handler
+// does not leave the goroutine running or the downstream client hanging.
+// The defer/recover in run() must call ContinueRequest and exit the goroutine.
+func TestLeak_HandlerPanic_DoesNotHang(t *testing.T) {
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		panic("intentional test panic")
+	})
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+
+	// The panic recovery must schedule ContinueRequest within 1s.
+	h.wait(t)
+
+	// continued must be true — panic recovery called ContinueRequest.
+	h.handle.mu.Lock()
+	assert.True(t, h.handle.continued, "ContinueRequest must be called even after handler panic")
+	h.handle.mu.Unlock()
+}
+
+// TestLeak_RespBuffer_ClientDisconnect verifies no goroutine leak when the
+// client disconnects while the ResponseFunc is reading r.Body in Buffer mode.
+func TestLeak_RespBuffer_ClientDisconnect(t *testing.T) {
+	started := make(chan struct{})
+	done := make(chan struct{})
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			close(started)
+			// Block reading — will unblock when OnStreamComplete closes the channel.
+			io.ReadAll(r.Body) //nolint:errcheck
+			close(done)
+		},
+		jisr.ResponseModeBuffer,
+	)
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	h.respBody([]byte("chunk"), false) // send one chunk — goroutine starts reading
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("response handler did not start")
+	}
+
+	// Simulate client disconnect — must close respBodyCh.
+	h.filter.OnStreamComplete()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("goroutine leaked: ResponseFunc did not exit after OnStreamComplete in Buffer mode")
+	}
+}
+
+// TestLeak_RegisterRaw_RoundTrip verifies RegisterRaw wires a raw factory
+// into WellKnownHttpFilterConfigFactories and it's callable.
+func TestLeak_RegisterRaw_RoundTrip(t *testing.T) {
+	name := t.Name()
+	created := false
+
+	jisr.RegisterRaw(name, &fakeRawFactory{onCreate: func() { created = true }})
+	t.Cleanup(func() { jisr.Unregister(name) })
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	factory, ok := factories[name]
+	require.True(t, ok, "raw factory must appear in WellKnownHttpFilterConfigFactories")
+
+	_, err := factory.Create(nil, nil)
+	require.NoError(t, err)
+	assert.True(t, created, "raw factory Create must be called")
+}
+
+type fakeRawFactory struct {
+	jisr.EmptyHttpFilterHandle // satisfies shared.HttpFilterConfigFactory via EmptyHttpFilterConfigFactory
+	onCreate func()
+}
+
+func (f *fakeRawFactory) Create(_ shared.HttpFilterConfigHandle, _ []byte) (shared.HttpFilterFactory, error) {
+	f.onCreate()
+	return &fakeRawFilterFactory{}, nil
+}
+func (f *fakeRawFactory) CreatePerRoute(_ []byte) (any, error) { return nil, nil }
+
+type fakeRawFilterFactory struct{}
+
+func (f *fakeRawFilterFactory) Create(_ shared.HttpFilterHandle) shared.HttpFilter {
+	return &fakeRawFilter{}
+}
+func (f *fakeRawFilterFactory) OnDestroy() {}
+
+type fakeRawFilter struct{ shared.EmptyHttpFilter }
+
+// TestLeak_ReplaceBody_Buffer verifies that ReplaceBody in Buffer mode
+// drains the Envoy-side buffer and appends the replacement bytes.
+func TestLeak_ReplaceBody_Buffer(t *testing.T) {
+	const replacement = `{"replaced":true}`
+
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			io.ReadAll(r.Body) //nolint:errcheck // drain the original body
+			w.ReplaceBody([]byte(replacement))
+		},
+		jisr.ResponseModeBuffer,
+	)
+
+	// Pre-load the fake response body buffer with "original" content.
+	h.handle.mu.Lock()
+	h.handle.respBodyBuf = &fakeBodyBuffer{data: []byte("original body")}
+	h.handle.mu.Unlock()
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	h.respBody([]byte("original body"), true)
+	h.waitResponse(t)
+
+	// After ReplaceBody: the fake buffer must contain the replacement.
+	h.handle.mu.Lock()
+	bufBytes := h.handle.respBodyBuf.Bytes()
+	h.handle.mu.Unlock()
+
+	assert.Equal(t, replacement, string(bufBytes),
+		"ReplaceBody must drain original and append replacement bytes")
+}
+
+// TestLeak_Log_IsCalled verifies r.Log() forwards to handle.Log without panic.
+func TestLeak_Log_IsCalled(t *testing.T) {
+	logged := make(chan string, 1)
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		r.Log(jisr.LogInfo, "test message %s", "hello")
+	})
+
+	// Patch the handle's Log to capture calls.
+	h.handle.logFn = func(level shared.LogLevel, msg string) {
+		logged <- msg
+	}
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+
+	select {
+	case msg := <-logged:
+		assert.Contains(t, msg, "test message hello")
+	case <-time.After(time.Second):
+		t.Fatal("r.Log() did not call handle.Log")
 	}
 }

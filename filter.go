@@ -361,6 +361,20 @@ func (f *handlerFilter) OnStreamComplete() {
 // run executes the request handler then the response handler in a single
 // goroutine for the full request+response lifecycle.
 func (f *handlerFilter) run(req *Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			f.handle.Log(shared.LogLevelError,
+				"jisr: panic in filter %q handler: %v", f.name, r)
+			// Ensure the filter chain is unblocked even after a panic.
+			// Schedule is safe to call from the deferred recover.
+			f.scheduler.Schedule(func() {
+				if !f.rw.responded {
+					f.handle.ContinueRequest()
+				}
+			})
+		}
+	}()
+
 	f.handler(f.ctx, f.rw, req)
 
 	// Finalize request phase: apply mutations and unblock Envoy's filter chain.
@@ -378,7 +392,10 @@ func (f *handlerFilter) run(req *Request) {
 		f.handle.ContinueRequest()
 	})
 
-	if f.respHandler == nil {
+	// If the request handler sent a direct response (w.Send/SendBytes), Envoy
+	// will never call OnResponseHeaders — skip the response phase to avoid
+	// parking the goroutine on respHeadersCh forever.
+	if f.rw.responded || f.respHandler == nil {
 		return
 	}
 
@@ -418,10 +435,22 @@ func (f *handlerFilter) run(req *Request) {
 	// Passthrough and Buffer: headers were stopped — schedule ContinueResponse
 	// on the worker thread so they flow to downstream now.
 	f.scheduler.Schedule(func() {
+		// Apply response header mutations.
 		if len(f.rw.respHeaderMuts) > 0 {
 			respHdrs := f.handle.ResponseHeaders()
 			for _, m := range f.rw.respHeaderMuts {
 				respHdrs.Set(m.key, m.value)
+			}
+		}
+		// Replace body if requested (Buffer mode only).
+		// Drain the Envoy-buffered body and append our replacement bytes.
+		if f.rw.bodyReplaced {
+			buf := f.handle.BufferedResponseBody()
+			if buf != nil {
+				buf.Drain(buf.GetSize())
+				if len(f.rw.replaceBody) > 0 {
+					buf.Append(f.rw.replaceBody)
+				}
 			}
 		}
 		f.handle.ContinueResponse()
