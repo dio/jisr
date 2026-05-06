@@ -132,8 +132,9 @@ func (g *Group) AddGoroutine(fn func(ctx context.Context)) {
 //
 //	WebSocket:        your http.Handler that calls websocket.Accept
 //	HTTP/2 cleartext: h2c.NewHandler(mux, &http2.Server{})
-//	gRPC:             grpc.Server (implements http.Handler via ServeHTTP)
-//	gRPC + REST:      vanguard.Transcoder or similar mux wrappers
+//	gRPC (TLS):       grpc.Server via ServeHTTP — requires HTTP/2 over TLS;
+//	                  for cleartext gRPC use grpc.Serve(ln) with g.Add directly
+//	gRPC + REST:      vanguard.Transcoder or h2c mux dispatching by Content-Type
 //
 // For a fixed port (e.g. declared in Envoy config), use [Group.AddListener].
 //

@@ -1,11 +1,11 @@
 package multiactor_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,7 +13,6 @@ import (
 	"github.com/dio/jisr/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"context"
 )
 
 // These tests exercise each actor type directly — no Envoy required.
@@ -239,38 +238,100 @@ func TestRawActor_DoesNotSpeakHTTP(t *testing.T) {
 	assert.Error(t, err, "raw actor does not speak HTTP — connection should be mangled")
 }
 
-// ── Utility: verify h2c and gRPC are just http.Handler ───────────────────────
+// TestGroup_gRPC_Cleartext_Pattern documents the correct way to run a cleartext
+// gRPC server inside a Group. grpc.Server.ServeHTTP requires HTTP/2+TLS and
+// is experimental — for cleartext, use grpc.Serve(ln) via g.Add directly.
+//
+// This test simulates that pattern without importing google.golang.org/grpc.
+func TestGroup_gRPC_Cleartext_Pattern(t *testing.T) {
+	// Simulate grpc.Server with a raw net.Listener — the real pattern is:
+	//
+	//   grpcSrv := grpc.NewServer()
+	//   mypb.RegisterMyServiceServer(grpcSrv, &myImpl{})
+	//   ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	//   g.Add(
+	//       func() error { return grpcSrv.Serve(ln) },
+	//       func() { grpcSrv.Stop() },
+	//   )
+	//
+	// grpcSrv.Serve(ln) runs its own HTTP/2 transport — it does NOT use
+	// net/http or http.Handler. Hence g.Add, not g.AddHTTP.
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+
+	g := server.NewGroup()
+	stopped := make(chan struct{})
+	g.Add(
+		func() error {
+			// Simulates grpcSrv.Serve(ln) — blocks on Accept, owns its own transport.
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					close(stopped)
+					return nil // ln.Close() triggered by grpcSrv.Stop() equivalent
+				}
+				conn.Close() // in real gRPC: handle the connection
+			}
+		},
+		func() { ln.Close() }, // equivalent of grpcSrv.Stop()
+	)
+
+	g.Start()
+
+	// Listener is active.
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	conn.Close()
+
+	g.Stop()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("gRPC-style actor did not stop")
+	}
+}
+
+
 
 func TestGroup_HandlerIsJustHTTP_AllProtocols(t *testing.T) {
-	// This test documents the composition rule:
-	// WebSocket, h2c, gRPC all reduce to http.Handler.
-	// Group.AddHTTP handles all of them without special cases.
+	// Documents the composition rule for HTTP-family protocols.
+	//
+	// WebSocket and h2c reduce cleanly to http.Handler.
+	//
+	// gRPC via ServeHTTP works ONLY with HTTP/2+TLS (experimental in grpc-go).
+	// For cleartext gRPC (the common case without TLS), use grpc.Serve(ln)
+	// with g.Add(execute, stop) — not AddHTTP.
+	//
+	// This test uses handler stubs to illustrate the shape, not real gRPC.
 
 	protocols := []struct {
 		name    string
 		handler http.Handler
 	}{
 		{
-			// Plain HTTP/1.1
 			"http/1.1",
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, "http1")
 			}),
 		},
 		{
-			// "h2c" — in this test just http.Handler; in production wrap with h2c.NewHandler
+			// h2c wraps any http.Handler — AddHTTP handles it directly.
 			"h2c-shape",
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprint(w, "h2c")
 			}),
 		},
 		{
-			// gRPC shape — grpc.Server also implements http.Handler
-			"grpc-shape",
+			// grpc.Server.ServeHTTP requires HTTP/2+TLS — only usable with AddHTTP
+			// when TLS is configured on the net/http server. For cleartext gRPC,
+			// use g.Add(func() error { return grpcSrv.Serve(ln) }, grpcSrv.Stop).
+			"grpc-via-ServeHTTP-TLS-only",
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// A real grpc.Server would check Content-Type: application/grpc here
-				if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
-					http.Error(w, "not grpc", http.StatusUnsupportedMediaType)
+				if r.ProtoMajor != 2 {
+					http.Error(w, "gRPC requires HTTP/2", http.StatusHTTPVersionNotSupported)
 					return
 				}
 				fmt.Fprint(w, "grpc")
