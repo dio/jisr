@@ -159,7 +159,7 @@ func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.
 		func() {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			_ = srv.Shutdown(ctx)
+			_ = srv.Shutdown(ctx) // error is context.DeadlineExceeded or ErrServerClosed — both benign at shutdown
 		},
 	)
 

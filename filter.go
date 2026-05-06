@@ -61,7 +61,7 @@ type handlerFilter struct {
 	// body pipeline
 	bodyCh     chan<- []byte
 	bodyReader *bodyReader
-	bodyDone   bool        // true once endStream seen in OnRequestBody
+	bodyDone   atomic.Bool // true once endStream seen in OnRequestBody
 	bodySkip   atomic.Bool // true after r.SkipBody() — passthrough mode
 	headDone   atomic.Bool // true after r.LimitBody() threshold reached — stream remainder
 
@@ -138,7 +138,7 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	if endStream {
 		// No body coming — close channel immediately so io.ReadAll returns empty.
 		close(bodyCh)
-		f.bodyDone = true
+		f.bodyDone.Store(true)
 	}
 
 	req := &Request{
@@ -152,7 +152,7 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 		skipBody: func() {
 			// CAS prevents double-close. Also check bodyDone — if endStream
 			// was true on headers, bodyCh is already closed.
-			if !f.bodyDone && f.bodySkip.CompareAndSwap(false, true) {
+			if !f.bodyDone.Load() && f.bodySkip.CompareAndSwap(false, true) {
 				close(bodyCh)
 			}
 		},
@@ -162,7 +162,7 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 				// Signal OnRequestBody to stop buffering and stream the rest.
 				f.headDone.Store(true)
 				// Close the channel so the handler's io.ReadAll returns.
-				if !f.bodyDone && !f.bodySkip.Load() {
+				if !f.bodyDone.Load() && !f.bodySkip.Load() {
 					close(bodyCh)
 				}
 			})
@@ -181,14 +181,14 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 
 // OnRequestBody is called by Envoy on the worker thread for each body chunk.
 func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) shared.BodyStatus {
-	if f.bodyDone {
+	if f.bodyDone.Load() {
 		return shared.BodyStatusContinue
 	}
 	// If SkipBody or LimitBody threshold was reached, stream chunks through
 	// without copying into Go memory.
 	if f.bodySkip.Load() || f.headDone.Load() {
 		if endStream {
-			f.bodyDone = true
+			f.bodyDone.Store(true)
 		}
 		return shared.BodyStatusContinue
 	}
@@ -203,7 +203,7 @@ func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) sh
 	}
 	if endStream {
 		close(f.bodyCh)
-		f.bodyDone = true
+		f.bodyDone.Store(true)
 	}
 	return shared.BodyStatusStopAndBuffer
 }

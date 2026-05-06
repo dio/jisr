@@ -30,6 +30,15 @@ func (b *bodyReader) setLimit(n int64, onLimit func()) {
 	b.onLimit = onLimit
 }
 
+// fireLimit calls onLimit exactly once and clears it.
+func (b *bodyReader) fireLimit() {
+	if b.onLimit != nil {
+		fn := b.onLimit
+		b.onLimit = nil
+		fn()
+	}
+}
+
 // Read implements io.Reader. Blocks until data is available or EOF.
 func (b *bodyReader) Read(p []byte) (int, error) {
 	for {
@@ -40,11 +49,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 				remaining := b.limit - b.read
 				if remaining <= 0 {
 					b.eof = true
-					if b.onLimit != nil {
-						fn := b.onLimit
-						b.onLimit = nil
-						fn()
-					}
+					b.fireLimit()
 					return 0, io.EOF
 				}
 				if int64(len(p)) > remaining {
@@ -55,11 +60,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 			b.read += int64(n)
 			if b.limit > 0 && b.read >= b.limit {
 				b.eof = true
-				if b.onLimit != nil {
-					fn := b.onLimit
-					b.onLimit = nil
-					fn()
-				}
+				b.fireLimit()
 				return n, io.EOF
 			}
 			return n, err
