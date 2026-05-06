@@ -76,6 +76,7 @@ func TestEcho_DirectResponse(t *testing.T) {
 	assert.Equal(t, "/ping", body.Path)
 	assert.Equal(t, http.MethodPost, body.Method)
 	assert.JSONEq(t, `{"hello":"world"}`, body.Body)
-	// Envoy normalises header names to lowercase (HTTP/2 convention).
-	assert.Equal(t, "abc123", body.Headers["x-request-id"])
+	// jisr applies http.CanonicalHeaderKey on ingress, so headers are
+	// in canonical form (X-Request-Id, not x-request-id) from the handler's view.
+	assert.Equal(t, "abc123", body.Headers["X-Request-Id"])
 }
