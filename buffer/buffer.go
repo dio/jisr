@@ -5,8 +5,6 @@
 // a streaming response body (SSE, NDJSON, chunked JSON) without buffering
 // the entire stream. The head+tail pattern covers the common case where
 // relevant data appears at the beginning and end of the stream.
-//
-// Inspired by ringan's BillingTap and zia's SSE parser.
 package buffer
 
 import "slices"
