@@ -131,7 +131,7 @@ func requestFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
     // r.StatusCode, r.Header available in all modes.
     // r.Body available in Observe and Buffer modes.
-    io.Copy(io.Discard, r.Body) // drain in Observe mode
+    io.Copy(io.Discard, r.Body) // consume in Observe: client already receiving simultaneously
 }
 ```
 
@@ -220,6 +220,17 @@ See [examples/decoder](examples/decoder) for the full zia-decoder style example.
 | `r.Log(level, fmt, args...)` | Log via Envoy's logger |
 
 Available attribute IDs: `jisr.AttrRequestPath`, `AttrRequestMethod`, `AttrRequestHost`, `AttrRequestScheme`, `AttrRequestQuery`, `AttrRequestProtocol`, `AttrRequestID`, `AttrRequestUserAgent`.
+
+### Response (`*jisr.Response`)
+
+Passed to a `ResponseFunc`. Available only in `RegisterWithResponse` / `RegisterWithConfigAndResponse`.
+
+| Field / Method | Description |
+|----------------|-------------|
+| `r.Header` | Upstream response headers as `http.Header` |
+| `r.StatusCode` | Upstream HTTP status code |
+| `r.Body` | `io.Reader` for the response body. Nil in `ResponseModePassthrough`; streaming in `ResponseModeObserve`; full-body in `ResponseModeBuffer` |
+| `r.SkipBody()` | Skip reading the body; remaining chunks forwarded to client without copying into Go memory. Use when you only need headers. No-op in Passthrough (Body is already nil) |
 
 ### ResponseWriter
 
