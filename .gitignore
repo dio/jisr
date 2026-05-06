@@ -1,2 +1,4 @@
 *.so
 *.h
+go.work
+go.work.sum
