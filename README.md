@@ -2,27 +2,9 @@
 
 **jisr** (جسر — Arabic for "bridge") is a net/http-style handler abstraction for writing [Envoy dynamic module](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/dynamic_modules) filters in Go.
 
-Instead of implementing the raw `HttpFilter` interface with status enums, event-loop thread discipline, and `UnsafeEnvoyBuffer` management, you register a `HandlerFunc` and write blocking code — jisr handles the goroutine bridge internally.
+Instead of implementing the raw `HttpFilter` interface with status enums, event-loop thread discipline, and `UnsafeEnvoyBuffer` management, you register a `HandlerFunc` and write blocking code. jisr handles the goroutine bridge internally.
 
-## Example
-
-```go
-package main
-
-import (
-    _ "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/abi"
-    sdk "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go"
-
-    "github.com/dio/jisr"
-    _ "github.com/my-org/my-filter" // registers handlers via init()
-)
-
-func init() {
-    sdk.RegisterHttpFilterConfigFactories(jisr.WellKnownHttpFilterConfigFactories())
-}
-
-func main() {}
-```
+## Quick start
 
 ```go
 // my-filter/filter.go
@@ -31,16 +13,15 @@ package myfilter
 import (
     "context"
     "net/http"
-
     "github.com/dio/jisr"
 )
 
 func init() {
-    jisr.Register("my-auth", jisr.Chain(authHandler, loggingMiddleware))
+    jisr.Register("my-auth", authHandler)
 }
 
-func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-    r.SkipBody() // header-only filter — skip body to avoid blocking
+func authHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+    r.SkipBody()
     if r.Header.Get("x-api-key") == "" {
         w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
         return
@@ -50,50 +31,189 @@ func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 }
 ```
 
-## Build
+```go
+// cmd/main.go
+package main
+
+import (
+    _ "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/abi"
+    sdk "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go"
+    "github.com/dio/jisr"
+    _ "github.com/my-org/my-filter"
+)
+
+func init() { sdk.RegisterHttpFilterConfigFactories(jisr.WellKnownHttpFilterConfigFactories()) }
+func main() {}
+```
 
 ```sh
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 ```
 
-## API
+## Response phase
 
-### Handler registration
-- `jisr.Register(name, fn)` — register a HandlerFunc for an Envoy filter name
-- `jisr.RegisterRaw(name, factory)` — escape hatch: register a raw SDK factory alongside jisr filters in the same .so
-- `jisr.Chain(handler, middlewares...)` — compose middleware (net/http style)
+Filters can span the full request+response lifecycle in a single goroutine using `RegisterWithResponse`:
 
-### Request
-- `r.Header` — request headers as `http.Header` (Go-owned, canonical keys, safe anywhere)
-- `r.Body` — request body as `io.Reader` (blocking, channel-backed)
-- `r.SkipBody()` — skip body buffering; chunks forwarded without buffering. Call for header-only filters
-- `r.Log(level, format, args...)` — log via Envoy's logger (`jisr.LogInfo`, `LogWarn`, etc.)
-- `r.FilterName` — the Envoy filter name this request matched
+```go
+jisr.RegisterWithResponse("resp-tap", requestFn, responseFn, jisr.ResponseModeObserve)
+```
 
-### Response
-- `w.Send(code, body)` — send local response, no upstream forwarding (any status)
-- `w.SendBytes(code, body)` — like Send but accepts `[]byte`
-- `w.SetRequestHeader(key, value)` — mutate request header before forwarding
-- `w.SetResponseHeader(key, value)` — set header on local response (before Send/SendBytes)
-- `w.SetMetadata(namespace, key, value)` — set Envoy dynamic metadata
-- `w.Stream(ctx, headers)` — begin streaming local response; returns a `StreamWriter`
+The request handler runs first, then blocks until upstream responds. The response handler receives upstream headers and (depending on mode) the response body:
 
-### StreamWriter (for SSE / chunked responses)
-- `sw.Flush(ctx, data)` — send a chunk; blocks until delivered (natural backpressure)
-- `sw.Close()` — send final empty chunk (endOfStream)
+```go
+func requestFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+    r.SkipBody()
+    w.SetRequestHeader("x-tapped", "1")
+}
 
-### Upstream callout
-- `jisr.Do(ctx, scheduler, handle, cluster, headers, body, timeoutMs)` — blocking Envoy HttpCallout
+func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+    // r.StatusCode, r.Header available in all modes.
+    // r.Body available in Observe and Buffer modes.
+    io.Copy(io.Discard, r.Body) // drain in Observe mode
+}
+```
 
-### Sub-packages
-- `jisr/server` — embedded background servers (WebSocket proxy, sidecar)
-- `jisr/buffer` — zero-allocation stream buffers (`Ring`, `HeadTail`) for SSE/chunked response parsing
+### Response modes
+
+| Mode | `r.Body` | Downstream latency | Use for |
+|------|----------|-------------------|---------|
+| `ResponseModePassthrough` | nil | zero | Header inspection, stamping |
+| `ResponseModeObserve` | streaming | zero | Token counting, logging, SSE tap |
+| `ResponseModeBuffer` | full body | full response | Response rewriting, transformation |
+
+The mode is declared once at registration and never changes at runtime — this lets `OnResponseHeaders` return the correct Envoy status immediately without blocking the worker thread.
+
+## Envoy-native metrics and routing
+
+Use `RegisterWithConfig` (request-only) or `RegisterWithConfigAndResponse` (full lifecycle) to define Envoy metrics at `.so` load time and use them per-request:
+
+```go
+var (
+    requestsTotal jisr.MetricID
+    ttftMs        jisr.MetricID
+)
+
+func init() {
+    jisr.RegisterWithConfigAndResponse("zia-decoder",
+        func(h jisr.ConfigHandle) error {
+            var err error
+            requestsTotal, err = h.DefineCounter("zia_requests_total", "cluster")
+            if err != nil {
+                return err
+            }
+            ttftMs, err = h.DefineHistogram("zia_ttft_ms", "cluster")
+            return err
+        },
+        decoderRequest,
+        decoderResponse,
+        jisr.ResponseModeObserve,
+    )
+}
+
+func decoderRequest(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+    r.LimitBody(8192) // read first 8KB for model field, stream the rest
+    head, _ := io.ReadAll(r.Body)
+
+    var req struct{ Model string `json:"model"` }
+    json.Unmarshal(head, &req)
+
+    cluster := resolveCluster(req.Model)
+    w.SetRequestHeader("x-cluster", cluster)
+    w.SetMetadata("zia", "cluster", cluster)
+    w.ClearRouteCache() // re-evaluate cluster_header route with new x-cluster value
+    w.IncrementCounter(requestsTotal, 1, cluster)
+}
+
+func decoderResponse(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+    // tap SSE token counts, record TTFT, etc.
+    w.RecordHistogram(ttftMs, measureTTFT(), cluster)
+}
+```
+
+See [examples/decoder](examples/decoder) for the full zia-decoder style example.
+
+## API reference
+
+### Registration
+
+| Function | Description |
+|----------|-------------|
+| `Register(name, fn)` | Request-only filter |
+| `RegisterWithResponse(name, reqFn, respFn, mode)` | Request + response filter |
+| `RegisterWithConfig(name, cfgFn, fn)` | Request-only with config/metrics setup |
+| `RegisterWithConfigAndResponse(name, cfgFn, reqFn, respFn, mode)` | Full lifecycle with config/metrics |
+| `RegisterRaw(name, factory)` | Escape hatch: raw SDK factory |
+| `Chain(handler, middlewares...)` | Compose middleware (outermost first) |
+
+### Request (`*jisr.Request`)
+
+| Field / Method | Description |
+|----------------|-------------|
+| `r.Header` | Request headers as `http.Header` (canonical keys, Go-owned) |
+| `r.Body` | Blocking `io.Reader` backed by Envoy body chunks |
+| `r.FilterName` | Envoy filter name matched for this request |
+| `r.SkipBody()` | Skip body buffering; chunks forwarded without copying into Go memory |
+| `r.LimitBody(n)` | Buffer first n bytes, stream the rest zero-copy |
+| `r.GetAttr(id)` | Pre-snapshotted Envoy stream attribute (path, method, host, …) |
+| `r.Log(level, fmt, args...)` | Log via Envoy's logger |
+
+Available attribute IDs: `jisr.AttrRequestPath`, `AttrRequestMethod`, `AttrRequestHost`, `AttrRequestScheme`, `AttrRequestQuery`, `AttrRequestProtocol`, `AttrRequestID`, `AttrRequestUserAgent`.
+
+### ResponseWriter
+
+| Method | Description |
+|--------|-------------|
+| `w.Send(code, body)` | Send local response; no upstream forwarding |
+| `w.SendBytes(code, body)` | Like Send but accepts `[]byte` |
+| `w.SetRequestHeader(k, v)` | Mutate request header before forwarding |
+| `w.SetResponseHeader(k, v)` | Set header on local response (before Send) |
+| `w.SetMetadata(ns, key, val)` | Set Envoy dynamic metadata |
+| `w.ClearRouteCache()` | Re-evaluate route after mutating a routing header |
+| `w.IncrementCounter(id, n, labels...)` | Increment an Envoy counter metric |
+| `w.RecordHistogram(id, n, labels...)` | Record an Envoy histogram observation |
+| `w.SetUpstreamResponseHeader(k, v)` | Mutate upstream response header (response phase only) |
+| `w.ReplaceBody(b)` | Replace upstream response body (`ResponseModeBuffer` only) |
+| `w.Stream(ctx, headers)` | Begin streaming local response; returns `StreamWriter` |
+
+### ConfigHandle (in ConfigFunc)
+
+| Method | Description |
+|--------|-------------|
+| `h.DefineCounter(name, tagKeys...)` | Define an Envoy counter metric |
+| `h.DefineHistogram(name, tagKeys...)` | Define an Envoy histogram metric |
+| `h.RawConfig() []byte` | Raw `filter_config` bytes from envoy.yaml |
+| `h.Log(level, fmt, args...)` | Log via Envoy's logger |
+
+### StreamWriter
+
+| Method | Description |
+|--------|-------------|
+| `sw.Flush(ctx, data)` | Send a chunk; blocks until delivered |
+| `sw.Close()` | Send final empty chunk (end of stream) |
+
+### Callout
+
+```go
+jisr.Do(ctx, scheduler, handle, cluster, headers, body, timeoutMs)
+```
+
+Blocking Envoy `HttpCallout` — connection pooling, retries, and circuit breaking from cluster config.
+
+## Sub-packages
+
+| Package | Description |
+|---------|-------------|
+| `jisr/server` | Background actor group for embedded servers and goroutines |
+| `jisr/buffer` | Zero-allocation stream buffers (`Ring`, `HeadTail`) for SSE/chunked parsing |
+| `jisr/prof` | pprof admin server for live `.so` debugging (`/healthz`, `/readyz`, `/version`, `/debug/pprof/*`) |
 
 ## How it works
 
-Each request spawns one goroutine. `OnRequestHeaders` copies header data into Go memory, creates a channel-backed `io.Reader` for the body, and returns `HeadersStatusStop` to suspend the filter chain. Body chunks from `OnRequestBody` are pushed into the channel. When the handler returns, `Scheduler.Schedule` hops back onto the Envoy worker thread to apply mutations and call `ContinueRequest`. Client disconnects cancel the context via `OnDestroy`.
+Each request spawns one goroutine. `OnRequestHeaders` copies headers into Go memory, creates a channel-backed `io.Reader` for the body, and returns `HeadersStatusStop` to suspend the filter chain. Body chunks from `OnRequestBody` are pushed into the channel (zero intermediate copy after `ToBytes()`). When the handler returns, `Scheduler.Schedule` hops back onto the Envoy worker thread to apply mutations (`SetRequestHeader`, `ClearRouteCache`, `IncrementCounter`, …) and call `ContinueRequest`.
 
-See [examples/hello](examples/hello) for a runnable example and [RATIONALE.md](RATIONALE.md) for design decisions.
+For response phase filters, the same goroutine blocks on a channel until `OnResponseHeaders` arrives, then runs the `ResponseFunc`. Passthrough and Buffer modes schedule `ContinueResponse` from the goroutine; Observe mode lets headers flow immediately (`HeadersStatusContinue`) and taps the body as it streams.
+
+See [examples/hello](examples/hello) for a runnable request-phase example and [examples/decoder](examples/decoder) for a full request+response lifecycle example.
 
 ## License
 
