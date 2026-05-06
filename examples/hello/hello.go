@@ -22,7 +22,9 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 }
 
 // helloHandler injects x-hello and forwards the request upstream.
+// SkipBody is called because this filter only touches headers.
 func helloHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+	r.SkipBody()
 	w.SetRequestHeader("x-hello", "from-jisr")
 }
 
