@@ -376,3 +376,8 @@ The two are complementary. Composer is the right choice when you need
 fine-grained streaming control or are building into the BOE ecosystem.
 jisr is the right choice when you want to write a filter the same way you
 write a `net/http` handler.
+
+---
+
+For a complete reference of behaviors discovered through real testing — what
+works, what is silently ignored, and why — see [CONSTRAINTS.md](CONSTRAINTS.md).

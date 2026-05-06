@@ -270,6 +270,8 @@ For response phase filters, the same goroutine blocks on a channel until `OnResp
 
 See [examples/hello](examples/hello) for a runnable request-phase example and [examples/decoder](examples/decoder) for a full request+response lifecycle example.
 
+For a complete reference of what works, what doesn't, and why — including response header mutation timing, attribute support, metrics rules, and SDK constraints — see [CONSTRAINTS.md](CONSTRAINTS.md).
+
 ## License
 
 Apache-2.0
