@@ -18,22 +18,21 @@ import (
 const (
 	envoyAddr = "http://localhost:10000"
 	adminAddr = "http://localhost:9901"
-	echoAddr  = "127.0.0.1:8080"
 )
 
 var (
 	projectRoot string
 	envoyCmd    *exec.Cmd
 	echoServer  *http.Server
+	echoPort    int
 )
 
 func TestMain(m *testing.M) {
 	_, file, _, _ := runtime.Caller(0)
-	// e2e/ is one level below the repo root; examples/hello is what we test.
 	projectRoot = filepath.Join(filepath.Dir(file), "..", "examples", "hello")
 
-	// 1. Start the echo backend (pure Go, no Python needed).
-	startEchoBackend()
+	// 1. Start the echo backend on a random free port.
+	echoPort = startEchoBackend()
 
 	// 2. Build libhello.so unless JISR_SKIP_BUILD=1.
 	if os.Getenv("JISR_SKIP_BUILD") == "" {
@@ -51,14 +50,21 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: build OK")
 	}
 
-	// 3. Start Envoy.
+	// 3. Start Envoy, injecting the random echo port via an env var that
+	//    envoy.yaml reads with %REF% or the simpler approach: write a
+	//    temp config with the port substituted.
 	envoyBin := os.Getenv("ENVOY_BIN")
 	if envoyBin == "" {
 		home, _ := os.UserHomeDir()
 		envoyBin = filepath.Join(home, ".local/share/boe/envoy-versions/1.37.1/bin/envoy")
 	}
+
+	// Write a temp envoy config with the actual echo backend port substituted.
+	cfgPath := writeEnvoyConfig(echoPort)
+	defer os.Remove(cfgPath)
+
 	envoyCmd = exec.Command(envoyBin,
-		"-c", filepath.Join(projectRoot, "envoy.yaml"),
+		"-c", cfgPath,
 		"--log-level", "warning",
 	)
 	envoyCmd.Env = append(os.Environ(),
@@ -71,7 +77,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "e2e: envoy start failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "e2e: envoy pid=%d\n", envoyCmd.Process.Pid)
+	fmt.Fprintf(os.Stderr, "e2e: envoy pid=%d, echo backend port=%d\n", envoyCmd.Process.Pid, echoPort)
 
 	if !waitReady(15 * time.Second) {
 		envoyCmd.Process.Kill()
@@ -88,33 +94,92 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// startEchoBackend starts a pure-Go HTTP server on :8080 that reflects all
-// received headers back as JSON. This lets tests verify what headers Envoy
-// injected into the upstream request.
-func startEchoBackend() {
+// startEchoBackend binds on a random free port and returns the port number.
+func startEchoBackend() int {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		headers := make(map[string]string, len(r.Header))
 		for k, v := range r.Header {
 			headers[k] = v[0]
 		}
-		body := map[string]any{
+		w.Header().Set("content-type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
 			"path":    r.URL.Path,
 			"method":  r.Method,
 			"headers": headers,
-		}
-		w.Header().Set("content-type", "application/json")
-		json.NewEncoder(w).Encode(body)
+		})
 	})
 
-	ln, err := net.Listen("tcp", echoAddr)
+	// :0 → OS assigns a free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: echo backend listen failed: %v\n", err)
 		os.Exit(1)
 	}
+	port := ln.Addr().(*net.TCPAddr).Port
 	echoServer = &http.Server{Handler: mux}
 	go echoServer.Serve(ln)
-	fmt.Fprintf(os.Stderr, "e2e: echo backend listening on %s\n", echoAddr)
+	fmt.Fprintf(os.Stderr, "e2e: echo backend listening on 127.0.0.1:%d\n", port)
+	return port
+}
+
+// writeEnvoyConfig creates a temp file with the backend port substituted in.
+func writeEnvoyConfig(backendPort int) string {
+	tmpl := fmt.Sprintf(`
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                http_filters:
+                  - name: hello
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: hello
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+
+  clusters:
+    - name: backend
+      type: STATIC
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, backendPort)
+
+	f, err := os.CreateTemp("", "jisr-e2e-envoy-*.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: failed to create temp config: %v\n", err)
+		os.Exit(1)
+	}
+	f.WriteString(tmpl)
+	f.Close()
+	return f.Name()
 }
 
 func waitReady(timeout time.Duration) bool {
