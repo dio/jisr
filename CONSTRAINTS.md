@@ -117,7 +117,16 @@ calls `http.CanonicalHeaderKey` internally. The result is that all headers in
 
 ---
 
-## Goroutine lifecycle
+## Handler construction (RegisterFactory)
+
+| Behavior | Notes |
+|----------|-------|
+| `RegisterFactory` factory called once per filter config `Create` | yes — if Envoy hot-reloads config, a new factory call produces a new handler instance |
+| `RegisterWithConfig` with multiple Envoy listeners sharing the same filter name | **no** — the `ConfigFunc` runs once per `Create` call and overwrites the same package-level vars. Use `RegisterFactory` when the same filter name may be instantiated with different configs |
+| Struct method as `HandlerFunc` | yes — `return r.Handle, nil` binds the method to the struct instance |
+| Factory error aborts `.so` load | yes — same behaviour as `ConfigFunc` returning an error |
+
+---
 
 | Behavior | Notes |
 |----------|-------|

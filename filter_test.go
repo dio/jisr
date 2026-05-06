@@ -1571,3 +1571,83 @@ func TestResponse_SkipBody_NoOpInPassthrough(t *testing.T) {
 		t.Fatal("Passthrough response handler did not complete")
 	}
 }
+
+// ── RegisterFactory / RegisterFactoryWithResponse ─────────────────────────────
+
+func TestRegisterFactory_ConstructsHandlerFromConfig(t *testing.T) {
+	defer jisr.Unregister("fac-test")
+
+	type state struct{ built bool }
+	var s state
+
+	jisr.RegisterFactory("fac-test", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+		// config context: parse config, define metrics, build struct
+		_ = h.RawConfig()
+		s.built = true
+		return func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+			r.SkipBody()
+			w.SetRequestHeader("x-built", "1")
+		}, nil
+	})
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	fac, ok := factories["fac-test"]
+	require.True(t, ok)
+	ff, err := fac.Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, ff)
+	assert.True(t, s.built, "factory must have been called during Create")
+}
+
+func TestRegisterFactory_ErrorAbortCreate(t *testing.T) {
+	defer jisr.Unregister("fac-err")
+
+	jisr.RegisterFactory("fac-err", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+		return nil, fmt.Errorf("bad factory config")
+	})
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	_, err := factories["fac-err"].Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	assert.Error(t, err)
+}
+
+func TestRegisterFactoryWithResponse_ConstructsBothHandlers(t *testing.T) {
+	defer jisr.Unregister("facresp-test")
+
+	type state struct{ reqBuilt, respBuilt bool }
+	var s state
+
+	jisr.RegisterFactoryWithResponse("facresp-test",
+		func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+			s.reqBuilt = true
+			reqFn := func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+				r.SkipBody()
+			}
+			respFn := func(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+				s.respBuilt = true
+			}
+			return reqFn, respFn, nil
+		},
+		jisr.ResponseModePassthrough,
+	)
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	fac, ok := factories["facresp-test"]
+	require.True(t, ok)
+	ff, err := fac.Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, ff)
+	assert.True(t, s.reqBuilt)
+}
+
+func TestRegisterFactory_PanicOnDuplicate(t *testing.T) {
+	defer jisr.Unregister("fac-dup")
+	jisr.RegisterFactory("fac-dup", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+		return func(_ context.Context, _ jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() }, nil
+	})
+	assert.Panics(t, func() {
+		jisr.RegisterFactory("fac-dup", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+			return nil, nil
+		})
+	})
+}

@@ -145,6 +145,55 @@ func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 
 The mode is declared once at registration and never changes at runtime — this lets `OnResponseHeaders` return the correct Envoy status immediately without blocking the worker thread.
 
+## Struct-based handlers
+
+When a handler needs per-config state — a parsed config struct, metric IDs,
+a connection pool — use `RegisterFactory` instead of package-level variables.
+The factory runs once at `.so` load time and returns a handler bound to that
+state:
+
+```go
+type Router struct {
+    cfg     *RouterConfig
+    counter jisr.MetricID
+    ttft    jisr.MetricID
+}
+
+func (r *Router) HandleRequest(_ context.Context, w jisr.ResponseWriter, req *jisr.Request) {
+    r.LimitBody(8192)
+    // ... use r.cfg, w.IncrementCounter(r.counter, ...)
+}
+
+func (r *Router) HandleResponse(_ context.Context, w jisr.ResponseWriter, resp *jisr.Response) {
+    resp.SkipBody()
+    w.RecordHistogram(r.ttft, measureTTFT())
+}
+
+func init() {
+    jisr.RegisterFactoryWithResponse("llm-router",
+        func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+            cfg, err := parseConfig(h.RawConfig())
+            if err != nil {
+                return nil, nil, err
+            }
+            counter, _ := h.DefineCounter("router_requests_total", "cluster")
+            ttft, _ := h.DefineHistogram("router_ttft_ms", "cluster")
+            r := &Router{cfg: cfg, counter: counter, ttft: ttft}
+            return r.HandleRequest, r.HandleResponse, nil
+        },
+        jisr.ResponseModeObserve,
+    )
+}
+```
+
+The factory pattern vs `RegisterWithConfig`:
+
+| | `RegisterWithConfig` | `RegisterFactory` |
+|---|---|---|
+| State storage | package-level vars | struct fields |
+| Multiple configs | shared vars (not safe) | each gets its own struct |
+| Testability | requires global state reset | construct struct directly in tests |
+
 ## Envoy-native metrics and routing
 
 Use `RegisterWithConfig` (request-only) or `RegisterWithConfigAndResponse` (full lifecycle) to define Envoy metrics at `.so` load time and use them per-request:
@@ -204,6 +253,8 @@ See [examples/decoder](examples/decoder) for the full runnable example.
 | `RegisterWithResponse(name, reqFn, respFn, mode)` | Request + response filter |
 | `RegisterWithConfig(name, cfgFn, fn)` | Request-only with config/metrics setup |
 | `RegisterWithConfigAndResponse(name, cfgFn, reqFn, respFn, mode)` | Full lifecycle with config/metrics |
+| `RegisterFactory(name, factoryFn)` | Request-only; factory constructs handler from config context — use when handler needs per-config state (parsed config, metric IDs) without package-level vars |
+| `RegisterFactoryWithResponse(name, factoryFn, mode)` | Full lifecycle; factory constructs both request and response handlers from config context |
 | `RegisterRaw(name, factory)` | Escape hatch: raw SDK factory |
 | `Chain(handler, middlewares...)` | Compose middleware (outermost first) |
 

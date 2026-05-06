@@ -14,7 +14,9 @@ import (
 
 type configFactory struct {
 	name        string
-	configFn    ConfigFunc // optional: nil for plain Register
+	configFn    ConfigFunc    // optional: nil for plain Register (side-effects only)
+	factoryFn   HandlerFactory // optional: returns handler from config context
+	respFactFn  ResponseHandlerFactory // optional: returns req+resp handler from config context
 	handler     HandlerFunc
 	respHandler ResponseFunc
 	respMode    ResponseMode
@@ -24,16 +26,41 @@ func (f *configFactory) Create(
 	h shared.HttpFilterConfigHandle,
 	raw []byte,
 ) (shared.HttpFilterFactory, error) {
-	if f.configFn != nil {
-		if err := f.configFn(&configHandleImpl{h: h, raw: raw}); err != nil {
+	ch := &configHandleImpl{h: h, raw: raw}
+
+	handler := f.handler
+	respHandler := f.respHandler
+
+	switch {
+	case f.respFactFn != nil:
+		// Factory returns both request and response handlers from config context.
+		reqFn, respFn, err := f.respFactFn(ch)
+		if err != nil {
+			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			return nil, err
+		}
+		handler = reqFn
+		respHandler = respFn
+	case f.factoryFn != nil:
+		// Factory returns just the request handler from config context.
+		fn, err := f.factoryFn(ch)
+		if err != nil {
+			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			return nil, err
+		}
+		handler = fn
+	case f.configFn != nil:
+		// Side-effects only (legacy RegisterWithConfig path).
+		if err := f.configFn(ch); err != nil {
 			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
 			return nil, err
 		}
 	}
+
 	return &filterFactory{
 		name:        f.name,
-		handler:     f.handler,
-		respHandler: f.respHandler,
+		handler:     handler,
+		respHandler: respHandler,
 		respMode:    f.respMode,
 	}, nil
 }

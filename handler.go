@@ -116,7 +116,55 @@ func (c *configHandleImpl) Log(level shared.LogLevel, format string, args ...any
 	c.h.Log(level, format, args...)
 }
 
-// ConfigFunc is called once when the filter's config factory is created
+// HandlerFactory is a constructor called once at filter config creation time.
+// It receives the ConfigHandle (for metrics, raw config) and returns a
+// HandlerFunc bound to that config instance. Use this instead of package-level
+// vars when the handler needs per-config state (parsed config, metric IDs, etc.)
+//
+//	type MyFilter struct {
+//	    cfg     *Config
+//	    counter jisr.MetricID
+//	}
+//
+//	func (f *MyFilter) Handle(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    w.IncrementCounter(f.counter, 1, f.cfg.Cluster)
+//	}
+//
+//	func init() {
+//	    jisr.RegisterFactory("my-filter", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+//	        cfg, err := parseConfig(h.RawConfig())
+//	        if err != nil { return nil, err }
+//	        counter, _ := h.DefineCounter("my_requests_total", "cluster")
+//	        f := &MyFilter{cfg: cfg, counter: counter}
+//	        return f.Handle, nil
+//	    })
+//	}
+type HandlerFactory func(h ConfigHandle) (HandlerFunc, error)
+
+// ResponseHandlerFactory is like HandlerFactory but returns both a request
+// HandlerFunc and a response ResponseFunc from the same config context.
+// Use with RegisterFactoryWithResponse for filters that need per-config state
+// across both the request and response phase.
+//
+//	type MyFilter struct {
+//	    cfg   *Config
+//	    ttft  jisr.MetricID
+//	}
+//
+//	func init() {
+//	    jisr.RegisterFactoryWithResponse("my-filter",
+//	        func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+//	            cfg, _ := parseConfig(h.RawConfig())
+//	            ttft, _ := h.DefineHistogram("ttft_ms", "cluster")
+//	            f := &MyFilter{cfg: cfg, ttft: ttft}
+//	            return f.HandleRequest, f.HandleResponse, nil
+//	        },
+//	        jisr.ResponseModeObserve,
+//	    )
+//	}
+type ResponseHandlerFactory func(h ConfigHandle) (HandlerFunc, ResponseFunc, error)
+
+
 // (i.e. when Envoy loads the .so). Use it to define metrics and parse config.
 // Return a non-nil error to abort .so load. Envoy will log the error.
 type ConfigFunc func(h ConfigHandle) error
@@ -455,7 +503,46 @@ var respModeRegistry = map[string]ResponseMode{}
 // rawRegistry maps filter names to raw SDK factories (escape hatch).
 var rawRegistry = map[string]shared.HttpFilterConfigFactory{}
 
-// RegisterWithConfig associates a ConfigFunc and a HandlerFunc with an Envoy filter name.
+// factoryRegistry maps filter names to HandlerFactory functions.
+var factoryRegistry = map[string]HandlerFactory{}
+
+// respFactRegistry maps filter names to ResponseHandlerFactory functions.
+var respFactRegistry = map[string]ResponseHandlerFactory{}
+
+// RegisterFactory registers a HandlerFactory for a filter name.
+// The factory is called once when Envoy loads the .so and returns a HandlerFunc
+// constructed from the config context. Use this when the handler needs
+// per-config state — parsed config, metric IDs, connections — without
+// resorting to package-level variables.
+//
+// See [HandlerFactory] for a full example.
+func RegisterFactory(name string, fn HandlerFactory) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	if _, exists := factoryRegistry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	factoryRegistry[name] = fn
+}
+
+// RegisterFactoryWithResponse registers a ResponseHandlerFactory for a filter
+// name. The factory returns both a request HandlerFunc and a response
+// ResponseFunc constructed from the same config context.
+//
+// See [ResponseHandlerFactory] for a full example.
+func RegisterFactoryWithResponse(name string, fn ResponseHandlerFactory, mode ResponseMode) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	if _, exists := respFactRegistry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	respFactRegistry[name] = fn
+	respModeRegistry[name] = mode
+}
+
+
 // The ConfigFunc runs once when the .so is loaded. Use it to define Envoy metrics
 // and parse filter config. The HandlerFunc runs per-request.
 //
@@ -553,6 +640,8 @@ func RegisterRaw(name string, factory shared.HttpFilterConfigFactory) {
 func Unregister(name string) {
 	delete(registry, name)
 	delete(configRegistry, name)
+	delete(factoryRegistry, name)
+	delete(respFactRegistry, name)
 	delete(respRegistry, name)
 	delete(respModeRegistry, name)
 	delete(rawRegistry, name)
@@ -562,7 +651,8 @@ func Unregister(name string) {
 // registered filters (both jisr HandlerFunc and raw). Pass this to
 // sdk.RegisterHttpFilterConfigFactories in your main package.
 func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFactory {
-	m := make(map[string]shared.HttpFilterConfigFactory, len(registry)+len(rawRegistry))
+	m := make(map[string]shared.HttpFilterConfigFactory,
+		len(registry)+len(factoryRegistry)+len(respFactRegistry)+len(rawRegistry))
 	for name, fn := range registry {
 		m[name] = &configFactory{
 			name:        name,
@@ -570,6 +660,19 @@ func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFact
 			handler:     fn,
 			respHandler: respRegistry[name],
 			respMode:    respModeRegistry[name],
+		}
+	}
+	for name, fn := range factoryRegistry {
+		m[name] = &configFactory{
+			name:      name,
+			factoryFn: fn,
+		}
+	}
+	for name, fn := range respFactRegistry {
+		m[name] = &configFactory{
+			name:       name,
+			respFactFn: fn,
+			respMode:   respModeRegistry[name],
 		}
 	}
 	maps.Copy(m, rawRegistry)
