@@ -349,6 +349,13 @@ func (f *handlerFilter) OnStreamComplete() {
 	if f.cancel != nil {
 		f.cancel()
 	}
+	// Close request body channel if open — unblocks a handler goroutine
+	// blocked on r.Body.Read (io.ReadAll) after client disconnect.
+	if f.bodyCh != nil && !f.bodyDone.Load() {
+		if f.bodySkip.CompareAndSwap(false, true) {
+			close(f.bodyCh)
+		}
+	}
 	// Close response body channel if open — unblocks ResponseFunc reading r.Body.
 	// CAS prevents double-close with OnResponseHeaders/OnResponseBody.
 	if f.respBodyCh != nil {

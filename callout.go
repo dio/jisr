@@ -37,7 +37,8 @@ func (cb *calloutCallback) OnHttpCalloutDone(
 		return
 	}
 
-	// Copy response headers into Go memory.
+	// Copy response headers into Go memory using canonical keys
+	// so resp.Header.Get() works with any casing — consistent with jisr.Request.Header.
 	h := make(http.Header, len(headers))
 	var status int
 	for _, kv := range headers {
@@ -47,7 +48,7 @@ func (cb *calloutCallback) OnHttpCalloutDone(
 			fmt.Sscanf(v, "%d", &status)
 			continue
 		}
-		h[k] = append(h[k], v)
+		h.Add(k, v)
 	}
 
 	// Assemble body.
