@@ -109,6 +109,7 @@ go test -race ./...
 
 - `RegisterFactoryWithResponse` — factory constructs `*AuthFilter` once at config time
 - Each Envoy listener that uses `auth` gets its own struct instance with its own config and metric IDs
+- `jisr.Chain` + `jisr.Middleware` — `loggingMiddleware` wraps `f.HandleRequest`; middleware composed inside the factory so it shares the same struct instance
 - Struct methods as `HandlerFunc` / `ResponseFunc` — `f.HandleRequest`, `f.HandleResponse`
 - `ResponseModePassthrough` for response header inspection without body overhead
 - Per-config metric IDs — `auth_requests_total` is separate per listener

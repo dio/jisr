@@ -91,10 +91,29 @@ func init() {
 				reqTotal:  reqTotal,
 				respTotal: respTotal,
 			}
-			return f.HandleRequest, f.HandleResponse, nil
+
+			// Chain composes middleware in declaration order.
+			// loggingMiddleware runs first, then f.HandleRequest.
+			// If HandleRequest short-circuits (401), loggingMiddleware still
+			// logs the outcome because it wraps the full call.
+			return jisr.Chain(f.HandleRequest, loggingMiddleware), f.HandleResponse, nil
 		},
 		jisr.ResponseModePassthrough,
 	)
+}
+
+// loggingMiddleware logs every request with its path, method, and outcome.
+// It is a jisr.Middleware: a function that wraps a HandlerFunc.
+// Defined at package level — it has no per-config state, so it doesn't need
+// to be a method on AuthFilter.
+func loggingMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
+	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.Log(jisr.LogInfo, "auth: %s %s",
+			r.GetAttr(jisr.AttrRequestMethod),
+			r.GetAttr(jisr.AttrRequestPath),
+		)
+		next(ctx, w, r)
+	}
 }
 
 // HandleRequest is the request phase. Validates x-api-key and either rejects

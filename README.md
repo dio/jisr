@@ -95,6 +95,10 @@ cancellation (client disconnect) propagates through the chain automatically.
 Chain is zero-allocation after construction — the composed function is a
 plain closure, no per-request allocation.
 
+See [examples/auth](examples/auth) for a complete example: `loggingMiddleware`
+is composed with `f.HandleRequest` inside a `RegisterFactoryWithResponse` factory,
+showing how stateless middleware can wrap a struct-bound handler.
+
 ## Modifying the upstream response
 
 Use `RegisterWithResponse` with `ResponseModeBuffer` to read, modify, or replace what the upstream sent before the client receives it.
