@@ -14,15 +14,22 @@ import (
 
 type configFactory struct {
 	name        string
+	configFn    ConfigFunc // optional — nil for Register (no setup)
 	handler     HandlerFunc
 	respHandler ResponseFunc
 	respMode    ResponseMode
 }
 
 func (f *configFactory) Create(
-	_ shared.HttpFilterConfigHandle,
-	_ []byte,
+	h shared.HttpFilterConfigHandle,
+	raw []byte,
 ) (shared.HttpFilterFactory, error) {
+	if f.configFn != nil {
+		if err := f.configFn(&configHandleImpl{h: h, raw: raw}); err != nil {
+			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			return nil, err
+		}
+	}
 	return &filterFactory{
 		name:        f.name,
 		handler:     f.handler,
@@ -96,6 +103,8 @@ type responseWriterImpl struct {
 	headerMuts  []headerMutation
 	respHeaders [][2]string
 	metaMuts    []metaMutation
+	clearRoute  bool             // queued ClearRouteCache — applied before ContinueRequest
+	metricMuts  []metricMutation // queued metric increments — applied before ContinueRequest
 
 	// response-phase mutations (applied before ContinueResponse)
 	respHeaderMuts []headerMutation
@@ -107,6 +116,24 @@ type headerMutation struct{ key, value string }
 type metaMutation struct {
 	namespace, key string
 	value          any
+}
+type metricMutation struct {
+	id     shared.MetricID
+	n      uint64
+	labels []string
+	hist   bool // false = counter, true = histogram
+}
+
+func (w *responseWriterImpl) ClearRouteCache() {
+	w.clearRoute = true
+}
+
+func (w *responseWriterImpl) IncrementCounter(id MetricID, n uint64, labels ...string) {
+	w.metricMuts = append(w.metricMuts, metricMutation{id: id, n: n, labels: labels})
+}
+
+func (w *responseWriterImpl) RecordHistogram(id MetricID, n uint64, labels ...string) {
+	w.metricMuts = append(w.metricMuts, metricMutation{id: id, n: n, labels: labels, hist: true})
 }
 
 func (w *responseWriterImpl) Send(statusCode int, body string) {
@@ -185,10 +212,31 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 		f.respBodyCh = respBodyCh
 	}
 
+	// Snapshot common Envoy stream attributes — read here on the worker thread
+	// so handlers can call r.GetAttr() from any goroutine without locking.
+	attrIDs := []shared.AttributeID{
+		shared.AttributeIDRequestPath,
+		shared.AttributeIDRequestMethod,
+		shared.AttributeIDRequestHost,
+		shared.AttributeIDRequestScheme,
+		shared.AttributeIDRequestQuery,
+		shared.AttributeIDRequestProtocol,
+		shared.AttributeIDRequestId,
+		shared.AttributeIDRequestUserAgent,
+		shared.AttributeIDRequestSize,
+	}
+	attrs := make(map[shared.AttributeID]string, len(attrIDs))
+	for _, id := range attrIDs {
+		if buf, ok := f.handle.GetAttributeString(id); ok {
+			attrs[id] = buf.ToString()
+		}
+	}
+
 	req := &Request{
 		Header:     h,
 		Body:       f.bodyReader,
 		FilterName: f.name,
+		attrs:      attrs,
 		log: func(level shared.LogLevel, format string, args ...any) {
 			// handle.Log is thread-safe in the Envoy SDK.
 			f.handle.Log(level, format, args...)
@@ -395,6 +443,16 @@ func (f *handlerFilter) run(req *Request) {
 		}
 		for _, m := range f.rw.metaMuts {
 			f.handle.SetMetadata(m.namespace, m.key, m.value)
+		}
+		if f.rw.clearRoute {
+			f.handle.ClearRouteCache()
+		}
+		for _, m := range f.rw.metricMuts {
+			if m.hist {
+				f.handle.RecordHistogramValue(m.id, m.n, m.labels...)
+			} else {
+				f.handle.IncrementCounterValue(m.id, m.n, m.labels...)
+			}
 		}
 		f.handle.ContinueRequest()
 	})

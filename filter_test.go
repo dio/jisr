@@ -565,6 +565,9 @@ func (m *mockWriter) SetRequestHeader(k, v string) {
 func (m *mockWriter) SetResponseHeader(_, _ string)                                  {}
 func (m *mockWriter) SetUpstreamResponseHeader(_, _ string)                           {}
 func (m *mockWriter) ReplaceBody(_ []byte)                                            {}
+func (m *mockWriter) ClearRouteCache()                                                {}
+func (m *mockWriter) IncrementCounter(_ jisr.MetricID, _ uint64, _ ...string)        {}
+func (m *mockWriter) RecordHistogram(_ jisr.MetricID, _ uint64, _ ...string)         {}
 func (m *mockWriter) SetMetadata(ns, k string, v any) {
 	m.mu.Lock(); defer m.mu.Unlock()
 	m.meta[ns+"/"+k] = v
@@ -1434,4 +1437,92 @@ func TestBodyRead_AfterLimitExhausted(t *testing.T) {
 
 	assert.Equal(t, "hel", string(firstRead))
 	assert.Empty(t, secondRead)
+}
+
+// ── RegisterWithConfig / ConfigHandle / new ResponseWriter methods ────────────
+
+func TestRegisterWithConfig_ConfigFnCalled(t *testing.T) {
+	defer jisr.Unregister("cfg-test")
+	called := false
+	jisr.RegisterWithConfig("cfg-test",
+		func(h jisr.ConfigHandle) error {
+			called = true
+			_ = h.RawConfig() // nil in test — no filter_config bytes
+			return nil
+		},
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+	)
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	fac, ok := factories["cfg-test"]
+	require.True(t, ok)
+	_, err := fac.Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.NoError(t, err)
+	assert.True(t, called, "ConfigFunc should have been called during Create")
+}
+
+func TestRegisterWithConfig_ConfigFnError_AbortCreate(t *testing.T) {
+	defer jisr.Unregister("cfg-err")
+	jisr.RegisterWithConfig("cfg-err",
+		func(h jisr.ConfigHandle) error { return fmt.Errorf("bad config") },
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+	)
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	_, err := factories["cfg-err"].Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	assert.Error(t, err, "Create should propagate ConfigFunc error")
+}
+
+func TestRegisterWithConfig_PanicOnDuplicate(t *testing.T) {
+	defer jisr.Unregister("cfg-dup")
+	jisr.RegisterWithConfig("cfg-dup", nil,
+		func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+	)
+	assert.Panics(t, func() {
+		jisr.RegisterWithConfig("cfg-dup", nil,
+			func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		)
+	})
+}
+
+func TestResponseWriter_ClearRouteCache(t *testing.T) {
+	h := newHarness(t, func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		w.SetRequestHeader("x-cluster", "openai")
+		w.ClearRouteCache() // must not panic; applied on worker thread
+	})
+	h.headers(map[string][]string{":path": {"/v1/chat"}}, true)
+	h.wait(t)
+	// ClearRouteCache is fire-and-forget on the mock scheduler —
+	// we verify it doesn't panic and the filter completes normally.
+}
+
+func TestResponseWriter_IncrementCounter_NoOp(t *testing.T) {
+	// MetricID(0) with EmptyHttpFilterHandle — must not panic.
+	h := newHarness(t, func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		w.IncrementCounter(jisr.MetricID(0), 1, "openai")
+	})
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+}
+
+func TestResponseWriter_RecordHistogram_NoOp(t *testing.T) {
+	h := newHarness(t, func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		w.RecordHistogram(jisr.MetricID(0), 42, "openai")
+	})
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+}
+
+func TestRequest_GetAttr_EmptyWhenNoAttrs(t *testing.T) {
+	// The test harness uses EmptyHttpFilterHandle which returns (nil, false)
+	// for GetAttributeString — so all attrs snapshot to empty string.
+	h := newHarness(t, func(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		// Should return "" (not panic) when attrs are missing.
+		assert.Equal(t, "", r.GetAttr(jisr.AttrRequestPath))
+		assert.Equal(t, "", r.GetAttr(jisr.AttrRequestMethod))
+	})
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
 }

@@ -57,6 +57,7 @@ package jisr
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -64,7 +65,77 @@ import (
 	"github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared"
 )
 
-// Log levels that map directly to Envoy's log levels.
+// MetricID is an opaque handle to an Envoy metric defined at config time.
+// It is a re-export of the SDK type — no wrapping, no conversion needed.
+type MetricID = shared.MetricID
+
+// ConfigHandle is the handle passed to a ConfigFunc at filter config creation time.
+// Use it to define Envoy metrics and read raw filter config bytes.
+// ConfigHandle methods must only be called from the ConfigFunc — not from handlers.
+type ConfigHandle interface {
+	// DefineCounter defines an Envoy counter metric with the given name and tag keys.
+	// Tag keys are declared once; tag values are provided per-increment via IncrementCounter.
+	DefineCounter(name string, tagKeys ...string) (MetricID, error)
+
+	// DefineHistogram defines an Envoy histogram metric with the given name and tag keys.
+	DefineHistogram(name string, tagKeys ...string) (MetricID, error)
+
+	// RawConfig returns the raw filter_config bytes from the Envoy config.
+	// Returns nil if no filter_config was provided.
+	RawConfig() []byte
+
+	// Log emits a message to Envoy's logger.
+	Log(level shared.LogLevel, format string, args ...any)
+}
+
+// configHandleImpl wraps shared.HttpFilterConfigHandle to implement ConfigHandle.
+type configHandleImpl struct {
+	h   shared.HttpFilterConfigHandle
+	raw []byte
+}
+
+func (c *configHandleImpl) DefineCounter(name string, tagKeys ...string) (MetricID, error) {
+	id, res := c.h.DefineCounter(name, tagKeys...)
+	if res != shared.MetricsSuccess {
+		return 0, fmt.Errorf("jisr: DefineCounter %q failed (result=%d)", name, res)
+	}
+	return id, nil
+}
+
+func (c *configHandleImpl) DefineHistogram(name string, tagKeys ...string) (MetricID, error) {
+	id, res := c.h.DefineHistogram(name, tagKeys...)
+	if res != shared.MetricsSuccess {
+		return 0, fmt.Errorf("jisr: DefineHistogram %q failed (result=%d)", name, res)
+	}
+	return id, nil
+}
+
+func (c *configHandleImpl) RawConfig() []byte { return c.raw }
+
+func (c *configHandleImpl) Log(level shared.LogLevel, format string, args ...any) {
+	c.h.Log(level, format, args...)
+}
+
+// ConfigFunc is called once when the filter's config factory is created
+// (i.e. when Envoy loads the .so). Use it to define metrics and parse config.
+// Return a non-nil error to abort .so load — Envoy will log the error.
+type ConfigFunc func(h ConfigHandle) error
+
+// Attr re-exports the SDK AttributeID constants for use with r.GetAttr.
+// These map directly to Envoy stream attributes — snapshotted in OnRequestHeaders.
+const (
+	AttrRequestPath      = shared.AttributeIDRequestPath
+	AttrRequestMethod    = shared.AttributeIDRequestMethod
+	AttrRequestHost      = shared.AttributeIDRequestHost
+	AttrRequestScheme    = shared.AttributeIDRequestScheme
+	AttrRequestQuery     = shared.AttributeIDRequestQuery
+	AttrRequestProtocol  = shared.AttributeIDRequestProtocol
+	AttrRequestID        = shared.AttributeIDRequestId
+	AttrRequestUserAgent = shared.AttributeIDRequestUserAgent
+	AttrRequestSize      = shared.AttributeIDRequestSize
+)
+
+
 // Use these with [Request.Log] so messages appear in Envoy's log output
 // with the correct level, worker thread ID, and timestamp.
 const (
@@ -94,10 +165,29 @@ type Request struct {
 	// FilterName is the Envoy filter name this request matched.
 	FilterName string
 
+	// attrs holds pre-snapshotted Envoy stream attributes, read in OnRequestHeaders
+	// on the worker thread before the handler goroutine is spawned.
+	attrs map[shared.AttributeID]string
+
 	// internal — wired by the filter bridge
 	log       func(level shared.LogLevel, format string, args ...any)
 	skipBody  func()
 	limitBody func(n int64)
+}
+
+// GetAttr returns a pre-snapshotted Envoy stream attribute by ID.
+// Attributes are read once in OnRequestHeaders on the Envoy worker thread —
+// this method is safe to call from any goroutine with no locking.
+//
+// Use the jisr Attr constants: [AttrRequestPath], [AttrRequestMethod], etc.
+//
+//	cluster := resolveCluster(r.Header.Get("x-model"))
+//	path    := r.GetAttr(jisr.AttrRequestPath)
+func (r *Request) GetAttr(id shared.AttributeID) string {
+	if r.attrs == nil {
+		return ""
+	}
+	return r.attrs[id]
 }
 
 // SkipBody signals jisr that this handler will not read the request body.
@@ -194,6 +284,22 @@ type ResponseWriter interface {
 	// ContinueRequest. value must be string, int64, float64, or bool.
 	// Has no effect if Send/SendBytes/Stream was called.
 	SetMetadata(namespace, key string, value any)
+
+	// ClearRouteCache clears Envoy's cached route for this stream, applied before
+	// ContinueRequest. Call after mutating a cluster-selection header (e.g. x-cluster)
+	// so Envoy re-evaluates the cluster_header route with the new value.
+	// Has no effect if Send/SendBytes/Stream was called.
+	ClearRouteCache()
+
+	// IncrementCounter adds n to the counter metric identified by id.
+	// labels are tag values in the same order as the tag keys declared in DefineCounter.
+	// Applied on the Envoy worker thread before ContinueRequest.
+	IncrementCounter(id MetricID, n uint64, labels ...string)
+
+	// RecordHistogram records a histogram observation.
+	// labels are tag values in the same order as the tag keys declared in DefineHistogram.
+	// Applied on the Envoy worker thread before ContinueRequest.
+	RecordHistogram(id MetricID, n uint64, labels ...string)
 
 	// SetUpstreamResponseHeader queues a mutation to the upstream response
 	// headers, applied before ContinueResponse. Only valid from a ResponseFunc.
@@ -313,6 +419,9 @@ func Chain(h HandlerFunc, middlewares ...Middleware) HandlerFunc {
 // registry maps filter names to HandlerFuncs.
 var registry = map[string]HandlerFunc{}
 
+// configRegistry maps filter names to ConfigFuncs (optional, for RegisterWithConfig).
+var configRegistry = map[string]ConfigFunc{}
+
 // respRegistry maps filter names to ResponseFuncs (optional, paired with registry).
 var respRegistry = map[string]ResponseFunc{}
 
@@ -321,6 +430,36 @@ var respModeRegistry = map[string]ResponseMode{}
 
 // rawRegistry maps filter names to raw SDK factories (escape hatch).
 var rawRegistry = map[string]shared.HttpFilterConfigFactory{}
+
+// RegisterWithConfig associates a ConfigFunc and a HandlerFunc with an Envoy filter name.
+// The ConfigFunc runs once when the .so is loaded — use it to define Envoy metrics
+// and parse filter config. The HandlerFunc runs per-request.
+//
+//	var requestsTotal jisr.MetricID
+//
+//	func init() {
+//	    jisr.RegisterWithConfig("zia-decoder",
+//	        func(h jisr.ConfigHandle) error {
+//	            var err error
+//	            requestsTotal, err = h.DefineCounter("zia_requests_total", "cluster")
+//	            return err
+//	        },
+//	        decoderHandler,
+//	    )
+//	}
+//
+//	func decoderHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    w.SetRequestHeader("x-cluster", resolveCluster(r))
+//	    w.ClearRouteCache()
+//	    w.IncrementCounter(requestsTotal, 1, "openai")
+//	}
+func RegisterWithConfig(name string, cfg ConfigFunc, fn HandlerFunc) {
+	if _, exists := registry[name]; exists {
+		panic("jisr: filter already registered: " + name)
+	}
+	registry[name] = fn
+	configRegistry[name] = cfg
+}
 
 // Register associates a HandlerFunc with an Envoy filter name.
 // Call from an init() function. Panics if the same name is registered twice.
@@ -356,6 +495,7 @@ func RegisterRaw(name string, factory shared.HttpFilterConfigFactory) {
 // Intended for use in tests — production code should not unregister filters.
 func Unregister(name string) {
 	delete(registry, name)
+	delete(configRegistry, name)
 	delete(respRegistry, name)
 	delete(respModeRegistry, name)
 	delete(rawRegistry, name)
@@ -369,6 +509,7 @@ func WellKnownHttpFilterConfigFactories() map[string]shared.HttpFilterConfigFact
 	for name, fn := range registry {
 		m[name] = &configFactory{
 			name:        name,
+			configFn:    configRegistry[name], // nil for plain Register — handled in Create
 			handler:     fn,
 			respHandler: respRegistry[name],
 			respMode:    respModeRegistry[name],
