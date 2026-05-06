@@ -1,0 +1,60 @@
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                http_filters:
+                  # api-backend: handles /api/* — responds directly from the .so.
+                  # Must be listed BEFORE spa so it intercepts /api/* first.
+                  - name: api-backend
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: spa
+                      filter_name: api-backend
+
+                  # spa: serves embedded Vite assets and falls back to index.html.
+                  # Runs after api-backend so /api/* never reaches it.
+                  - name: spa
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: spa
+                      filter_name: spa
+
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: app
+                      domains: ["*"]
+                      routes:
+                        # Both filters respond directly — the blackhole cluster is
+                        # never contacted. It must exist for the router to accept the config.
+                        - match: { prefix: "/" }
+                          route: { cluster: blackhole }
+
+  clusters:
+    # Never reached — all requests are handled by the filters above.
+    - name: blackhole
+      type: STATIC
+      load_assignment:
+        cluster_name: blackhole
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
