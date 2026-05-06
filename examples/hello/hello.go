@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/dio/jisr"
 )
@@ -37,6 +38,8 @@ func init() {
 	// Response-phase filters.
 	jisr.RegisterWithResponse("resp-stamp", skipBodyHandler, respStampHandler, jisr.ResponseModePassthrough)
 	jisr.RegisterWithResponse("resp-tap", skipBodyHandler, respTapHandler, jisr.ResponseModeObserve)
+	jisr.RegisterWithResponse("resp-rewrite", skipBodyHandler, respRewriteHandler, jisr.ResponseModeBuffer)
+	jisr.RegisterWithResponse("resp-header-stamp", skipBodyHandler, respHeaderStampHandler, jisr.ResponseModeBuffer)
 }
 
 func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
@@ -81,7 +84,42 @@ func respTapHandler(_ context.Context, _ jisr.ResponseWriter, r *jisr.Response) 
 	io.Copy(io.Discard, r.Body) //nolint:errcheck
 }
 
-// echoHandler replies directly without forwarding upstream.
+// respRewriteHandler rewrites the upstream JSON response body in Buffer mode.
+// The full upstream body is accumulated before the client receives anything.
+// We parse it, inject a "processed" field, fix content-length, then replace.
+func respRewriteHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil || len(body) == 0 {
+		return
+	}
+
+	// Parse upstream JSON and inject a new field.
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil {
+		return // not JSON — leave body untouched (ReplaceBody not called)
+	}
+	obj["x_jisr_rewritten"] = true
+
+	rewritten, err := json.Marshal(obj)
+	if err != nil {
+		return
+	}
+
+	w.SetUpstreamResponseHeader("content-length", strconv.Itoa(len(rewritten)))
+	w.SetUpstreamResponseHeader("x-jisr-rewritten", "1")
+	w.ReplaceBody(rewritten)
+}
+
+// respHeaderStampHandler adds x-jisr-stamp to the upstream response headers
+// using Buffer mode so the header mutation is applied before ContinueResponse.
+// In Passthrough mode, Envoy may have already forwarded body chunks before
+// the scheduled header mutation fires — Buffer mode avoids this race.
+func respHeaderStampHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+	// Drain the body — we don't modify it, but we must read it in Buffer mode
+	// so the goroutine unblocks and the scheduler can call ContinueResponse.
+	io.Copy(io.Discard, r.Body) //nolint:errcheck
+	w.SetUpstreamResponseHeader("x-jisr-stamp", strconv.Itoa(r.StatusCode))
+}
 func echoHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {

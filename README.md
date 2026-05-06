@@ -50,6 +50,61 @@ func main() {}
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 ```
 
+## Modifying the upstream response
+
+Use `RegisterWithResponse` with `ResponseModeBuffer` to read, modify, or replace what the upstream sent before the client receives it.
+
+### Inject a field into a JSON response body
+
+```go
+jisr.RegisterWithResponse("json-enricher", skipBodyFn, enricher, jisr.ResponseModeBuffer)
+
+func enricher(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+    body, err := io.ReadAll(r.Body) // full upstream body — client waits
+    if err != nil || len(body) == 0 {
+        return
+    }
+
+    var obj map[string]any
+    if json.Unmarshal(body, &obj) != nil {
+        return // not JSON — leave body untouched (don't call ReplaceBody)
+    }
+    obj["processed"] = true
+
+    rewritten, _ := json.Marshal(obj)
+    w.SetUpstreamResponseHeader("content-length", strconv.Itoa(len(rewritten)))
+    w.ReplaceBody(rewritten)
+}
+```
+
+### Add a header to the upstream response
+
+`SetUpstreamResponseHeader` must be used with `ResponseModeBuffer`. In `ResponseModePassthrough`, Envoy may have started forwarding the body before the scheduled header mutation fires, making the mutation ineffective.
+
+```go
+jisr.RegisterWithResponse("header-stamp", skipBodyFn, stamp, jisr.ResponseModeBuffer)
+
+func stamp(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+    io.Copy(io.Discard, r.Body) // drain body — not modifying it, but must read to unblock
+    w.SetUpstreamResponseHeader("x-processed-by", "jisr")
+    w.SetUpstreamResponseHeader("x-upstream-status", strconv.Itoa(r.StatusCode))
+}
+```
+
+### What each mode can do
+
+| | `Passthrough` | `Observe` | `Buffer` |
+|---|---|---|---|
+| Read response headers | yes | yes | yes |
+| Set upstream response headers | no* | no* | yes |
+| Read response body | no | yes (streaming) | yes (full) |
+| Replace response body | no | no | yes |
+| Added downstream latency | zero | zero | full response |
+
+\* `SetUpstreamResponseHeader` is silently ignored in Passthrough and Observe modes due to Envoy's header forwarding timing. Use Buffer mode for any response header mutations.
+
+See [examples/hello/hello.go](examples/hello/hello.go) for `resp-rewrite` (body injection) and `resp-header-stamp` (header addition), both e2e-tested against real Envoy.
+
 ## Response phase
 
 Filters can span the full request+response lifecycle in a single goroutine using `RegisterWithResponse`:

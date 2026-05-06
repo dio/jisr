@@ -17,11 +17,13 @@ import (
 )
 
 const (
-	envoyAddr      = "http://localhost:10000" // hello filter
-	envoyEchoAddr  = "http://localhost:10001" // hello-echo direct response
-	envoyStampAddr = "http://localhost:10002" // resp-stamp (Passthrough)
-	envoyTapAddr   = "http://localhost:10003" // resp-tap (Observe)
-	adminAddr      = "http://localhost:9901"
+	envoyAddr         = "http://localhost:10000" // hello filter
+	envoyEchoAddr     = "http://localhost:10001" // hello-echo direct response
+	envoyStampAddr    = "http://localhost:10002" // resp-stamp (Passthrough)
+	envoyTapAddr      = "http://localhost:10003" // resp-tap (Observe)
+	envoyRewriteAddr  = "http://localhost:10005" // resp-rewrite (Buffer — JSON body rewrite)
+	envoyHStampAddr   = "http://localhost:10006" // resp-header-stamp (Passthrough — add header)
+	adminAddr         = "http://localhost:9901"
 )
 
 var (
@@ -146,6 +148,15 @@ func startEchoBackend() int {
 		w.Header().Set("content-type", "application/json")
 		w.Header().Set("content-length", fmt.Sprintf("%d", len(payload)))
 		fmt.Fprint(w, payload)
+	})
+
+	// /json — structured JSON with known fields; used for body-rewrite e2e tests.
+	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"service": "backend",
+			"version": 1,
+		})
 	})
 
 	// /chunked — sends body in two chunks then closes cleanly.
@@ -388,6 +399,64 @@ static_resources:
                       routes:
                         - match: { prefix: "/" }
                           route: { cluster: noconnect }
+
+    # Port 10005 — resp-rewrite filter: Buffer mode, rewrites JSON response body.
+    - name: resp-rewrite
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10005 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: resp_rewrite
+                http_filters:
+                  - name: resp-rewrite
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: resp-rewrite
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rewrite
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+
+    # Port 10006 — resp-header-stamp filter: Buffer, adds x-jisr-stamp header.
+    - name: resp-header-stamp
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10006 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: resp_header_stamp
+                http_filters:
+                  - name: resp-header-stamp
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: hello
+                      filter_name: resp-header-stamp
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: hstamp
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
 
   clusters:
     - name: backend
