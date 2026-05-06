@@ -1,7 +1,57 @@
-// Package jisr provides a net/http-style API for writing Envoy dynamic module filters.
-// Instead of implementing the raw HttpFilter interface with status enums, goroutine
-// scheduling, and UnsafeEnvoyBuffer discipline, you register a HandlerFunc and write
-// blocking code — jisr handles the event-loop bridge internally.
+// Package jisr provides a net/http-style API for writing Envoy dynamic module
+// filters in Go.
+//
+// Instead of implementing the raw HttpFilter interface — with event-loop thread
+// discipline, status enums, and UnsafeEnvoyBuffer management — you register a
+// [HandlerFunc] and write ordinary blocking code. jisr bridges the goroutine
+// onto Envoy's worker thread internally.
+//
+// # Quick start
+//
+//	func init() {
+//	    jisr.Register("my-filter", jisr.Chain(myHandler, loggingMiddleware))
+//	}
+//
+//	func myHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+//	    if r.Header.Get("x-api-key") == "" {
+//	        w.SendError(401, `{"error":"missing api key"}`)
+//	        return
+//	    }
+//	    w.SetRequestHeader("x-user-id", "alice")
+//	    // return without SendError → request forwarded upstream
+//	}
+//
+// # Building a .so
+//
+// Create a cmd/main.go that imports the abi package and your filter package,
+// then register with the SDK:
+//
+//	package main
+//
+//	import (
+//	    _ "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/abi"
+//	    sdk "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go"
+//	    "github.com/dio/jisr"
+//	    _ "your/filter/package"
+//	)
+//
+//	func init() { sdk.RegisterHttpFilterConfigFactories(jisr.WellKnownHttpFilterConfigFactories()) }
+//	func main() {}
+//
+// Build:
+//
+//	CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
+//
+// # How it works
+//
+// Each request spawns one goroutine. [OnRequestHeaders] copies all header data
+// into Go-owned memory, creates a channel-backed [io.Reader] for the body, and
+// returns StopAllAndBuffer to suspend the Envoy filter chain. Body chunks pushed
+// by OnRequestBody are forwarded into the channel. When the handler returns,
+// [Scheduler.Schedule] hops back onto the Envoy worker thread to apply mutations
+// and call ContinueRequest. Client disconnects cancel the context via OnDestroy.
+//
+// See https://github.com/dio/jisr/tree/main/examples/hello for a runnable example.
 package jisr
 
 import (
