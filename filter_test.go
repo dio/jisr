@@ -145,10 +145,10 @@ func newHarness(t *testing.T, fn jisr.HandlerFunc) *harness {
 	return &harness{filter: filter, handle: handle}
 }
 
-func newHarnessWithResponse(t *testing.T, fn jisr.HandlerFunc, rfn jisr.ResponseFunc) *harness {
+func newHarnessWithResponse(t *testing.T, fn jisr.HandlerFunc, rfn jisr.ResponseFunc, mode jisr.ResponseMode) *harness {
 	t.Helper()
 	name := t.Name()
-	jisr.RegisterWithResponse(name, fn, rfn)
+	jisr.RegisterWithResponse(name, fn, rfn, mode)
 	t.Cleanup(func() { jisr.Unregister(name) })
 
 	factories := jisr.WellKnownHttpFilterConfigFactories()
@@ -786,10 +786,11 @@ func TestResponse_Passthrough(t *testing.T) {
 			r.SkipBody()
 		},
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			r.Passthrough()
 			gotStatus = r.StatusCode
 			gotContentType = r.Header.Get("Content-Type")
+			// r.Body is nil in Passthrough — mode declared at registration
 		},
+		jisr.ResponseModePassthrough,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
@@ -814,8 +815,10 @@ func TestResponse_Passthrough_BodyNotBuffered(t *testing.T) {
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			r.Passthrough()
+			// Passthrough — r.Body is nil, nothing to read
+			assert.Nil(t, r.Body)
 		},
+		jisr.ResponseModePassthrough,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
@@ -834,28 +837,40 @@ func TestResponse_Passthrough_BodyNotBuffered(t *testing.T) {
 // while they simultaneously flow to downstream. OnResponseBody returns Continue.
 func TestResponse_Observe(t *testing.T) {
 	var tapped []byte
+	done := make(chan struct{})
 
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			r.Observe()
 			tapped, _ = io.ReadAll(r.Body)
+			close(done)
 		},
+		jisr.ResponseModeObserve,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
 	h.wait(t)
-	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+
+	// Observe: OnResponseHeaders returns Continue immediately — headers flow.
+	status := h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	assert.Equal(t, shared.HeadersStatusContinue, status)
 
 	s1 := h.respBody([]byte("hello "), false)
 	s2 := h.respBody([]byte("world"), true)
-	h.waitResponse(t)
+
+	// Wait for goroutine to finish reading the tapped body.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("response handler did not complete")
+	}
 
 	// Observe returns Continue — body flows to downstream simultaneously.
 	assert.Equal(t, shared.BodyStatusContinue, s1)
 	assert.Equal(t, shared.BodyStatusContinue, s2)
 	assert.Equal(t, "hello world", string(tapped))
-	assert.True(t, h.handle.continuedResp)
+	// Observe mode: no ContinueResponse needed (headers already flowed).
+	assert.False(t, h.handle.continuedResp)
 }
 
 // TestResponse_Buffer: handler reads complete body before ContinueResponse.
@@ -866,9 +881,9 @@ func TestResponse_Buffer(t *testing.T) {
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			r.Buffer()
 			buffered, _ = io.ReadAll(r.Body)
 		},
+		jisr.ResponseModeBuffer,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
@@ -902,15 +917,15 @@ func TestResponse_NoRespHandler(t *testing.T) {
 	assert.Equal(t, shared.BodyStatusContinue, sb)
 }
 
-// TestResponse_DefaultPassthrough: ResponseFunc declared but no mode called —
-// defaults to Passthrough. ContinueResponse must still be called.
+// TestResponse_DefaultPassthrough: mode explicitly set to Passthrough —
+// ContinueResponse is called, headers flowed via Stop then Continue.
 func TestResponse_DefaultPassthrough(t *testing.T) {
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			// no mode declared — defaults to Passthrough
-			_ = r.StatusCode // just read headers
+			_ = r.StatusCode // inspect headers only
 		},
+		jisr.ResponseModePassthrough,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
@@ -930,9 +945,8 @@ func TestResponse_ContextCancelledOnStreamComplete(t *testing.T) {
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-			r.Observe()
 			close(respStarted)
-			// Block reading body — will unblock when ctx is cancelled.
+			// Block reading body — will unblock when channel is closed by OnStreamComplete.
 			buf := make([]byte, 4)
 			for {
 				_, err := r.Body.Read(buf)
@@ -942,6 +956,7 @@ func TestResponse_ContextCancelledOnStreamComplete(t *testing.T) {
 			}
 			close(respDone)
 		},
+		jisr.ResponseModeObserve,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
