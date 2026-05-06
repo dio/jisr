@@ -5,6 +5,7 @@ use (
 	./buffer
 	./e2e
 	./examples/hello
+	./examples/multi-actor
 	./examples/spa
 	./examples/sse-tap
 	./examples/ws-proxy
