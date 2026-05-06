@@ -95,24 +95,151 @@ supports streaming. jisr does not stream — every response is a single complete
 buffer (Envoy's `SendLocalResponse`). A combined `Send(code, body)` is the
 honest API for a non-streaming, single-shot response.
 
-## What You Give Up
+## What You Give Up — and the Escape Hatches
 
-jisr is not free. Three real costs:
+jisr is not free. Three real costs, each with a targeted escape hatch.
+
+---
 
 **Full body buffering.** The abstraction always delivers the complete request
 body before the handler runs. Raw SDK filters can process and forward chunks
 before the full body arrives — jisr cannot without breaking the blocking API.
 For auth, rate limiting, token counting, header rewriting, this is fine.
-For large file upload proxying, use the raw SDK.
+For large file upload proxying, it is not.
+
+*Escape hatch: `r.SkipBody()`.*
+If your handler only needs headers and never reads `r.Body`, call `r.SkipBody()`
+at the top of the handler. jisr closes the body channel immediately — any
+pending `io.ReadAll` returns EOF — and subsequent `OnRequestBody` calls forward
+chunks to Envoy without buffering. Zero memory overhead for header-only filters:
+
+```go
+func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+    r.SkipBody() // never reads body — skip to avoid buffering
+    if r.Header.Get("x-api-key") == "" {
+        w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
+        return
+    }
+    w.SetRequestHeader("x-user-id", "alice")
+}
+```
+
+---
+
+**No chunk-by-chunk response streaming.** `Send`/`SendBytes` flush a complete
+buffer. SSE or chunked response generation must happen upstream — jisr cannot
+stream a local response incrementally.
+
+*Escape hatch: `w.Stream(ctx, headers)`.*
+Returns a `StreamWriter` that lets you push chunks one at a time. Each
+`Flush(ctx, data)` call schedules `SendResponseData` onto the Envoy worker
+thread and blocks until delivered — providing natural backpressure. `Close()`
+sends the final `endOfStream`.
+
+```go
+func sseHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+    r.SkipBody()
+    sw, err := w.Stream(ctx, [][2]string{
+        {"content-type", "text/event-stream"},
+        {"cache-control", "no-cache"},
+    })
+    if err != nil {
+        return
+    }
+    defer sw.Close()
+
+    ticker := time.NewTicker(time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return // client disconnected
+        case t := <-ticker.C:
+            event := fmt.Sprintf("data: {\"time\":%q}\n\n", t.Format(time.RFC3339))
+            if err := sw.Flush(ctx, []byte(event)); err != nil {
+                return
+            }
+        }
+    }
+}
+```
+
+---
 
 **One goroutine per request.** Same model as `net/http`. Go handles tens of
 thousands of goroutines efficiently — this is not a practical concern at any
 realistic filter concurrency. But it is not zero overhead like a pure
 `HttpCallout`-based filter.
 
-**No chunk-by-chunk response streaming.** `Send`/`SendBytes` flush a complete
-buffer. SSE or chunked response generation must happen upstream — jisr cannot
-stream a local response incrementally.
+*No escape hatch needed.* If you genuinely need zero goroutine overhead, use
+`jisr.RegisterRaw` (see below) and implement the raw SDK filter directly.
+
+---
+
+**Some protocols cannot be intercepted at all.** WebSocket frames arrive after
+a 101 Switching Protocols handshake. Envoy does not call `OnRequestBody` or
+`OnResponseBody` for WebSocket frames — they are raw TCP data. A jisr handler
+(or any dynamic module filter) cannot inspect them.
+
+*Escape hatch: `jisr.RegisterRaw` + `jisr/server.NewEmbedded`.*
+Register a raw SDK factory for filters that need response-phase callbacks,
+per-chunk body processing, or full protocol control. In the same `.so`, run an
+embedded `net/http` server on a background goroutine — Envoy routes the
+problematic traffic (e.g. WebSocket upgrades) to that server via a local
+STATIC cluster, bypassing the filter chain entirely.
+
+```go
+func init() {
+    // jisr-managed filter for normal HTTP
+    jisr.Register("my-auth", authHandler)
+
+    // raw SDK factory for a filter that needs OnResponseBody callbacks
+    jisr.RegisterRaw("my-decoder", &rawDecoderFactory{})
+}
+```
+
+For the embedded server pattern (WebSocket proxy, protocol escape):
+
+```go
+// In your raw config factory Create():
+ctx, stop := server.Background(func(ctx context.Context) {
+    <-ctx.Done() // keep alive
+})
+
+srv, err := server.NewEmbedded(ctx, myWSHandler)
+// srv.Port() → configure in Envoy STATIC cluster
+// store stop → call from OnDestroy
+```
+
+`jisr/server` handles lifecycle: `Background` ties the server's lifetime to
+`OnDestroy` via context cancellation. `NewEmbedded` binds a random free port
+and shuts down cleanly on context cancel.
+
+---
+
+**Tapping SSE streams without buffering.** jisr's handler cannot intercept
+upstream response bodies — that requires `OnResponseBody`, which is a raw SDK
+concern. But when you do implement a raw `OnResponseBody` filter (via
+`RegisterRaw`), extracting token counts from a large SSE stream without
+buffering the whole thing is non-trivial.
+
+*Helper: `jisr/buffer.HeadTail`.*
+Captures the first N bytes and last M bytes of a stream in a fixed-size
+ring — zero allocation after construction. Designed for the LLM SSE pattern
+where input tokens appear near the start and output tokens near the end:
+
+```go
+ht := buffer.NewHeadTail(8*1024, 64*1024) // head 8KB, tail 64KB
+
+// In OnResponseBody:
+for _, chunk := range body.GetChunks() {
+    ht.Write(chunk.ToUnsafeBytes())
+}
+
+// After endOfStream:
+extractInputTokens(ht.Head())  // first 8KB — message_start
+extractOutputTokens(ht.Tail()) // last 64KB — message_delta / usage
+```
 
 ## What You Keep
 
