@@ -128,6 +128,15 @@ func (g *Group) AddGoroutine(fn func(ctx context.Context)) {
 // AddHTTP starts a net/http server on a random free port and registers it as
 // an actor. The server is bound immediately — Addr() is valid before Start.
 //
+// handler covers all HTTP-family protocols — pass the appropriate handler:
+//
+//	WebSocket:        your http.Handler that calls websocket.Accept
+//	HTTP/2 cleartext: h2c.NewHandler(mux, &http2.Server{})
+//	gRPC:             grpc.Server (implements http.Handler via ServeHTTP)
+//	gRPC + REST:      vanguard.Transcoder or similar mux wrappers
+//
+// For a fixed port (e.g. declared in Envoy config), use [Group.AddListener].
+//
 // timeout controls how long graceful shutdown waits for active connections.
 // Use 0 for the default (5 seconds).
 func (g *Group) AddHTTP(handler http.Handler, timeout time.Duration) (*Server, error) {
@@ -165,7 +174,45 @@ func (g *Group) AddHTTP(handler http.Handler, timeout time.Duration) (*Server, e
 	return s, nil
 }
 
-// Start launches all registered actors in background goroutines. Non-blocking.
+// AddListener registers an existing net.Listener as an HTTP actor.
+// Use when the port must match a pre-declared Envoy STATIC cluster config value
+// rather than binding a random port.
+//
+//	ln, err := net.Listen("tcp", "127.0.0.1:10001") // port declared in envoy.yaml
+//	if err != nil { return nil, err }
+//	srv := g.AddListener(ln, myHandler, 5*time.Second)
+//
+// timeout controls how long graceful shutdown waits for active connections.
+// Use 0 for the default (5 seconds).
+func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.Duration) *Server {
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+
+	srv := &http.Server{
+		Handler:      handler,
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+	}
+
+	s := &Server{listener: ln, srv: srv}
+
+	g.Add(
+		func() error {
+			if err := srv.Serve(ln); err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		},
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+		},
+	)
+
+	return s
+}
 //
 // When any actor finishes (for any reason — normal return, error, or panic),
 // Stop is called automatically to interrupt all remaining actors.

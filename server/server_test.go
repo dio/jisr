@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -203,4 +204,29 @@ func TestGroup_AddrAndPort_ConsistentBeforeStart(t *testing.T) {
 
 	g.Start()
 	g.Stop()
+}
+
+func TestGroup_AddListener_FixedPort(t *testing.T) {
+	// Bind a specific listener before passing to Group — simulates a port
+	// declared in envoy.yaml that must match exactly.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	fixedAddr := ln.Addr().String()
+
+	g := server.NewGroup()
+	srv := g.AddListener(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "fixed-port")
+	}), 0)
+	g.Start()
+	defer g.Stop()
+
+	// The server uses the pre-bound listener — Addr matches.
+	assert.Equal(t, fixedAddr, srv.Addr())
+
+	resp, err := http.Get("http://" + srv.Addr() + "/")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "fixed-port", string(body))
 }
