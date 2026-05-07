@@ -1,6 +1,44 @@
 package jisr
 
-import "io"
+import (
+	"io"
+	"sync"
+)
+
+// bodyPipe coordinates Envoy body callbacks with the handler goroutine.
+//
+// The data channel is never closed. EOF/cancellation is signalled through done,
+// which prevents send-on-closed-channel races when SkipBody or OnStreamComplete
+// runs concurrently with OnRequestBody/OnResponseBody.
+type bodyPipe struct {
+	ch   chan []byte
+	done chan struct{}
+	once sync.Once
+}
+
+func newBodyPipe() *bodyPipe {
+	return &bodyPipe{
+		ch:   make(chan []byte, 16), // small buffer to absorb burst chunks
+		done: make(chan struct{}),
+	}
+}
+
+func (p *bodyPipe) send(data []byte, cancel <-chan struct{}) bool {
+	select {
+	case p.ch <- data:
+		return true
+	case <-p.done:
+		return false
+	case <-cancel:
+		return false
+	}
+}
+
+func (p *bodyPipe) close() {
+	p.once.Do(func() {
+		close(p.done)
+	})
+}
 
 // bodyReader is a channel-backed io.Reader that assembles Envoy body chunks
 // into a blocking stream without internal buffering.
@@ -14,7 +52,7 @@ import "io"
 //   - Read() into caller's p:           1 copy (io.Reader contract, unavoidable)
 //   - bytes.Buffer.Write():             0 copies (eliminated)
 type bodyReader struct {
-	ch      chan []byte
+	pipe    *bodyPipe
 	cur     []byte // current chunk being served
 	off     int    // read offset into cur
 	eof     bool
@@ -23,9 +61,9 @@ type bodyReader struct {
 	onLimit func() // called exactly once when read >= limit
 }
 
-func newBodyReader() (*bodyReader, chan<- []byte) {
-	ch := make(chan []byte, 16) // small buffer to absorb burst chunks
-	return &bodyReader{ch: ch}, ch
+func newBodyReader() (*bodyReader, *bodyPipe) {
+	pipe := newBodyPipe()
+	return &bodyReader{pipe: pipe}, pipe
 }
 
 // setLimit configures a read cap. Once n bytes have been delivered to the
@@ -89,12 +127,27 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// Block for the next chunk (or channel close = EOF).
-		chunk, ok := <-b.ch
-		if !ok {
-			b.eof = true
-			return 0, io.EOF
+		// Prefer queued chunks before observing EOF. This preserves natural EOF:
+		// On*Body sends the final chunks, then closes done.
+		select {
+		case chunk := <-b.pipe.ch:
+			b.cur = chunk
+			continue
+		default:
 		}
-		b.cur = chunk
+
+		select {
+		case chunk := <-b.pipe.ch:
+			b.cur = chunk
+		case <-b.pipe.done:
+			// A chunk may have been queued just as done closed. Drain it before EOF.
+			select {
+			case chunk := <-b.pipe.ch:
+				b.cur = chunk
+			default:
+				b.eof = true
+				return 0, io.EOF
+			}
+		}
 	}
 }

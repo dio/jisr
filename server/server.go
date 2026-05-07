@@ -165,7 +165,7 @@ func (g *Group) AddListener(ln net.Listener, handler http.Handler, timeout time.
 
 	return s
 }
-//
+
 // When any actor finishes (for any reason (normal return, error, or panic),
 // Stop is called automatically to interrupt all remaining actors.
 //

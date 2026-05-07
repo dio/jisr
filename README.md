@@ -150,7 +150,7 @@ func enricher(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 jisr.RegisterWithResponse("header-stamp", skipBodyFn, stamp, jisr.ResponseModeBuffer)
 
 func stamp(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-    r.SkipBody() // not modifying the body — forward it as-is, unblock immediately
+    io.Copy(io.Discard, r.Body) // not modifying the body — drain Envoy's buffer
     w.SetUpstreamResponseHeader("x-processed-by", "jisr")
     w.SetUpstreamResponseHeader("x-upstream-status", strconv.Itoa(r.StatusCode))
 }
@@ -166,7 +166,7 @@ func stamp(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 | Replace response body | no | no | yes |
 | Added downstream latency | zero | zero | full response |
 
-\* `SetUpstreamResponseHeader` is silently ignored in Passthrough and Observe modes due to Envoy's header forwarding timing. Use Buffer mode for any response header mutations.
+\* `SetUpstreamResponseHeader` is a no-op in Passthrough and Observe modes due to Envoy's header forwarding timing. Use Buffer mode for any response header mutations.
 
 See [examples/hello/hello.go](examples/hello/hello.go) for `resp-rewrite` (body injection) and `resp-header-stamp` (header addition), both e2e-tested against real Envoy.
 
@@ -197,7 +197,7 @@ func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 
 | Mode | `r.Body` | Downstream latency | Use for |
 |------|----------|-------------------|---------|
-| `ResponseModePassthrough` | nil | zero | Header inspection, stamping |
+| `ResponseModePassthrough` | nil | zero | Header inspection, metrics |
 | `ResponseModeObserve` | streaming | zero | Token counting, logging, SSE tap |
 | `ResponseModeBuffer` | full body | full response | Response rewriting, transformation |
 
@@ -205,10 +205,11 @@ The mode is declared once at registration and never changes at runtime — this 
 
 ## Struct-based handlers
 
-When a handler needs per-config state — a parsed config struct, metric IDs,
-a connection pool — use `RegisterFactory` instead of package-level variables.
-The factory runs once at `.so` load time and returns a handler bound to that
-state:
+When a production handler needs per-config state — a parsed config struct,
+metric IDs, caches, clients, or request+response state — prefer
+`RegisterFactory` / `RegisterFactoryWithResponse` over package-level variables.
+The factory runs once per Envoy filter config `Create` call and returns handlers
+bound to that state:
 
 ```go
 type Router struct {
@@ -258,7 +259,10 @@ allowed key sets, each getting its own independent `*AuthFilter` instance.
 
 ## Envoy-native metrics and routing
 
-Use `RegisterWithConfig` (request-only) or `RegisterWithConfigAndResponse` (full lifecycle) to define Envoy metrics at `.so` load time and use them per-request:
+For simple filters, `RegisterWithConfig` (request-only) or
+`RegisterWithConfigAndResponse` (full lifecycle) can define Envoy metrics at
+`.so` load time and use them per-request. Prefer factory mode when the same
+filter name may be instantiated with different config bytes:
 
 ```go
 var (
@@ -315,8 +319,8 @@ See [examples/decoder](examples/decoder) for the full runnable example.
 | `RegisterWithResponse(name, reqFn, respFn, mode)` | Request + response filter |
 | `RegisterWithConfig(name, cfgFn, fn)` | Request-only with config/metrics setup |
 | `RegisterWithConfigAndResponse(name, cfgFn, reqFn, respFn, mode)` | Full lifecycle with config/metrics |
-| `RegisterFactory(name, factoryFn)` | Request-only; factory constructs handler from config context — use when handler needs per-config state (parsed config, metric IDs) without package-level vars |
-| `RegisterFactoryWithResponse(name, factoryFn, mode)` | Full lifecycle; factory constructs both request and response handlers from config context |
+| `RegisterFactory(name, factoryFn)` | Preferred for production request-only filters with per-config state; factory must return a non-nil handler |
+| `RegisterFactoryWithResponse(name, factoryFn, mode)` | Preferred for production full-lifecycle filters with per-config state; factory must return non-nil request and response handlers |
 | `RegisterRaw(name, factory)` | Escape hatch: raw SDK factory |
 | `Chain(handler, middlewares...)` | Compose request middleware (outermost first) |
 | `ResponseChain(handler, middlewares...)` | Compose response middleware (outermost first) |
@@ -344,7 +348,7 @@ Passed to a `ResponseFunc`. Available only in `RegisterWithResponse` / `Register
 | `r.Header` | Upstream response headers as `http.Header` |
 | `r.StatusCode` | Upstream HTTP status code |
 | `r.Body` | `io.Reader` for the response body. Nil in `ResponseModePassthrough`; streaming in `ResponseModeObserve`; full-body in `ResponseModeBuffer` |
-| `r.SkipBody()` | Skip reading the body; remaining chunks forwarded to client without copying into Go memory. Use when you only need headers. No-op in Passthrough (Body is already nil) |
+| `r.SkipBody()` | Skip reading the body; remaining chunks forwarded to client without copying into Go memory. Use for header inspection, not header mutation. No-op in Passthrough (Body is already nil) |
 
 ### ResponseWriter
 
@@ -358,8 +362,8 @@ Passed to a `ResponseFunc`. Available only in `RegisterWithResponse` / `Register
 | `w.ClearRouteCache()` | Re-evaluate route after mutating a routing header |
 | `w.IncrementCounter(id, n, labels...)` | Increment an Envoy counter metric |
 | `w.RecordHistogram(id, n, labels...)` | Record an Envoy histogram observation |
-| `w.SetUpstreamResponseHeader(k, v)` | Mutate upstream response header (response phase only) |
-| `w.ReplaceBody(b)` | Replace upstream response body (`ResponseModeBuffer` only) |
+| `w.SetUpstreamResponseHeader(k, v)` | Mutate upstream response header in `ResponseModeBuffer`; no-op in other modes |
+| `w.ReplaceBody(b)` | Replace upstream response body in `ResponseModeBuffer`; no-op in other modes |
 | `w.Stream(ctx, headers)` | Begin streaming local response; returns `StreamWriter` |
 
 ### ConfigHandle (in ConfigFunc)
@@ -396,7 +400,7 @@ Blocking Envoy `HttpCallout` — connection pooling, retries, and circuit breaki
 
 ## How it works
 
-Each request spawns one goroutine. `OnRequestHeaders` copies headers into Go memory, creates a channel-backed `io.Reader` for the body, and returns `HeadersStatusStop` to suspend the filter chain. Body chunks from `OnRequestBody` are pushed into the channel (zero intermediate copy after `ToBytes()`). When the handler returns, `Scheduler.Schedule` hops back onto the Envoy worker thread to apply mutations (`SetRequestHeader`, `ClearRouteCache`, `IncrementCounter`, …) and call `ContinueRequest`.
+Each request spawns one goroutine. `OnRequestHeaders` copies headers into Go memory, creates a pipe-backed `io.Reader` for the body, and returns `HeadersStatusStop` to suspend the filter chain. Body chunks from `OnRequestBody` are pushed into the pipe (zero intermediate copy after `ToBytes()`). When the handler returns, `Scheduler.Schedule` hops back onto the Envoy worker thread to apply mutations (`SetRequestHeader`, `ClearRouteCache`, `IncrementCounter`, …) and call `ContinueRequest`.
 
 For response phase filters, the same goroutine blocks on a channel until `OnResponseHeaders` arrives, then runs the `ResponseFunc`. Passthrough and Buffer modes schedule `ContinueResponse` from the goroutine; Observe mode lets headers flow immediately (`HeadersStatusContinue`) and taps the body as it streams.
 

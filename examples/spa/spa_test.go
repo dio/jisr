@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	spa "github.com/dio/jisr/examples/spa"
 	"github.com/dio/jisr"
+	spa "github.com/dio/jisr/examples/spa"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

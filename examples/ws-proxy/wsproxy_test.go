@@ -156,9 +156,9 @@ func TestWSProxy_OpenAI_Responses_RoundTrip(t *testing.T) {
 
 	// Send response.create.
 	create := map[string]any{
-		"type":               "response.create",
-		"model":              "gpt-4o-mini",
-		"max_output_tokens":  20,
+		"type":              "response.create",
+		"model":             "gpt-4o-mini",
+		"max_output_tokens": 20,
 		"input": []map[string]any{{
 			"type":    "message",
 			"role":    "user",

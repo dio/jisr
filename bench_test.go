@@ -100,7 +100,7 @@ func BenchmarkHeaderCopy_DirectMap(b *testing.B) {
 // ── Benchmark: Chain / closure allocation ─────────────────────────────────────
 
 func noopHandler(_ context.Context, _ ResponseWriter, r *Request) { r.SkipBody() }
-func noopMiddleware(next HandlerFunc) HandlerFunc                   { return next }
+func noopMiddleware(next HandlerFunc) HandlerFunc                 { return next }
 
 // BenchmarkChain_Single benchmarks calling a single handler (no middleware).
 func BenchmarkChain_Single(b *testing.B) {
@@ -133,9 +133,9 @@ func BenchmarkBodyReader_SmallChunk(b *testing.B) {
 	b.SetBytes(int64(len(chunk)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		br, ch := newBodyReader()
-		ch <- chunk
-		close(ch)
+		br, pipe := newBodyReader()
+		pipe.send(chunk, nil)
+		pipe.close()
 		buf := make([]byte, len(chunk)+1)
 		_, _ = br.Read(buf)
 	}
@@ -148,9 +148,9 @@ func BenchmarkBodyReader_LargeChunk(b *testing.B) {
 	b.SetBytes(int64(len(chunk)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		br, ch := newBodyReader()
-		ch <- chunk
-		close(ch)
+		br, pipe := newBodyReader()
+		pipe.send(chunk, nil)
+		pipe.close()
 		buf := make([]byte, len(chunk)+1)
 		_, _ = br.Read(buf)
 	}
@@ -167,12 +167,12 @@ func BenchmarkBodyReader_MultiChunk(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		br, ch := newBodyReader()
+		br, pipe := newBodyReader()
 		go func() {
 			for _, c := range chunks {
-				ch <- c
+				pipe.send(c, nil)
 			}
-			close(ch)
+			pipe.close()
 		}()
 		buf := make([]byte, 256)
 		for {

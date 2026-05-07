@@ -15,8 +15,8 @@ jobs:
     name: unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -26,35 +26,19 @@ jobs:
           cache: npm
           cache-dependency-path: examples/spa/ui/package-lock.json
       - name: build spa ui
-        run: cd examples/spa && make ui
+        run: make build-spa-ui
       - name: verify go.mod tidy
-        run: |
-          for d in . server buffer prof e2e examples/hello examples/auth examples/decoder examples/sse-tap examples/multi-actor examples/ws-proxy examples/spa; do
-            (cd "$d" && GOWORK=off go mod tidy)
-          done
-          git diff --exit-code -- '**go.mod' '**go.sum'
-      - name: build jisr
-        run: CGO_ENABLED=1 go build ./...
-      - name: test jisr
-        run: go test -race ./...
-      - name: test jisr/server
-        run: cd server && go test -race ./...
-      - name: test jisr/buffer
-        run: cd buffer && go test -race ./...
-      - name: test jisr/prof
-        run: cd prof && go test -race ./...
-      - name: test examples/decoder
-        run: cd examples/decoder && go test -race ./...
-      - name: test examples/auth
-        run: cd examples/auth && go test -race ./...
-      - name: test examples/sse-tap
-        run: cd examples/sse-tap && go test -race ./...
-      - name: test examples/multi-actor
-        run: cd examples/multi-actor && go test -race ./...
-      - name: test examples/spa
-        run: cd examples/spa && go test -race ./...
-      - name: test examples/ws-proxy
-        run: cd examples/ws-proxy && go test -race ./...
+        run: make tidy-check
+      - name: verify formatting
+        run: make fmt-check
+      - name: vet all modules
+        run: make vet-all
+      - name: test all modules
+        run: make test-all
+      - name: race test all modules
+        run: make race-all
+      - name: build examples
+        run: make build-examples
 
   # ── e2e: build all .so files and run against real Envoy ───────────────────
   e2e:
@@ -62,9 +46,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -86,15 +70,8 @@ jobs:
           tar -xJf /tmp/envoy.tar.xz --strip-components=2 -C .envoy
           chmod +x .envoy/envoy
 
-      - name: build libhello.so
-        run: make -C examples/hello build
-
-      - name: build libdecoder.so
-        run: make -C examples/decoder build
-
       - name: run e2e tests
         env:
           ENVOY_BIN: ${{ github.workspace }}/.envoy/envoy
           JISR_SKIP_BUILD: "1"
-        run: |
-          cd e2e && go test -v -tags e2e -timeout 60s ./...
+        run: make e2e

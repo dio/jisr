@@ -12,7 +12,7 @@ response modes and the most common filter patterns.
 | `resp-stamp` | Passthrough | Runs on the response path. Inspects `r.StatusCode` and `r.Header` without touching the body |
 | `resp-tap` | Observe | Consumes the response body as it streams to the client simultaneously. Zero added latency |
 | `resp-rewrite` | Buffer | Reads the full JSON response body, injects `x_jisr_rewritten: true`, updates `content-length`, replaces body |
-| `resp-header-stamp` | Buffer | Calls `r.SkipBody()` and adds `x-jisr-stamp: <status>` to the upstream response headers |
+| `resp-header-stamp` | Buffer | Drains the buffered response body and adds `x-jisr-stamp: <status>` to the upstream response headers |
 
 ## Build
 

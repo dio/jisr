@@ -41,8 +41,8 @@ func (EmptyHttpFilterHandle) GetMetadataListBool(shared.MetadataSourceType, stri
 func (EmptyHttpFilterHandle) GetFilterState(string) (shared.UnsafeEnvoyBuffer, bool) {
 	return shared.UnsafeEnvoyBuffer{}, false
 }
-func (EmptyHttpFilterHandle) SetFilterState(string, []byte)                     {}
-func (EmptyHttpFilterHandle) SetFilterStateTyped(string, []byte) bool           { return false }
+func (EmptyHttpFilterHandle) SetFilterState(string, []byte)           {}
+func (EmptyHttpFilterHandle) SetFilterStateTyped(string, []byte) bool { return false }
 func (EmptyHttpFilterHandle) GetFilterStateTyped(string) (shared.UnsafeEnvoyBuffer, bool) {
 	return shared.UnsafeEnvoyBuffer{}, false
 }
@@ -51,30 +51,30 @@ func (EmptyHttpFilterHandle) GetAttributeString(shared.AttributeID) (shared.Unsa
 }
 func (EmptyHttpFilterHandle) GetAttributeNumber(shared.AttributeID) (float64, bool) { return 0, false }
 func (EmptyHttpFilterHandle) GetAttributeBool(shared.AttributeID) (bool, bool)      { return false, false }
-func (EmptyHttpFilterHandle) GetData(string) any                                     { return nil }
-func (EmptyHttpFilterHandle) SetData(string, any)                                    {}
-func (EmptyHttpFilterHandle) SendLocalResponse(uint32, [][2]string, []byte, string)  {}
-func (EmptyHttpFilterHandle) SendResponseHeaders([][2]string, bool)                  {}
-func (EmptyHttpFilterHandle) SendResponseData([]byte, bool)                          {}
-func (EmptyHttpFilterHandle) SendResponseTrailers([][2]string)                       {}
-func (EmptyHttpFilterHandle) AddCustomFlag(string)                                   {}
-func (EmptyHttpFilterHandle) ContinueRequest()                                       {}
-func (EmptyHttpFilterHandle) ContinueResponse()                                      {}
-func (EmptyHttpFilterHandle) ClearRouteCache()                                       {}
-func (EmptyHttpFilterHandle) RefreshRouteCluster()                                   {}
-func (EmptyHttpFilterHandle) RequestHeaders() shared.HeaderMap                       { return nil }
-func (EmptyHttpFilterHandle) BufferedRequestBody() shared.BodyBuffer                 { return nil }
-func (EmptyHttpFilterHandle) ReceivedRequestBody() shared.BodyBuffer                 { return nil }
-func (EmptyHttpFilterHandle) RequestTrailers() shared.HeaderMap                      { return nil }
-func (EmptyHttpFilterHandle) ResponseHeaders() shared.HeaderMap                      { return nil }
-func (EmptyHttpFilterHandle) BufferedResponseBody() shared.BodyBuffer                { return nil }
-func (EmptyHttpFilterHandle) ReceivedResponseBody() shared.BodyBuffer                { return nil }
-func (EmptyHttpFilterHandle) ReceivedBufferedRequestBody() bool                      { return false }
-func (EmptyHttpFilterHandle) ReceivedBufferedResponseBody() bool                     { return false }
-func (EmptyHttpFilterHandle) ResponseTrailers() shared.HeaderMap                     { return nil }
-func (EmptyHttpFilterHandle) GetMostSpecificConfig() any                             { return nil }
-func (EmptyHttpFilterHandle) GetScheduler() shared.Scheduler                         { return nil }
-func (EmptyHttpFilterHandle) Log(shared.LogLevel, string, ...any)                    {}
+func (EmptyHttpFilterHandle) GetData(string) any                                    { return nil }
+func (EmptyHttpFilterHandle) SetData(string, any)                                   {}
+func (EmptyHttpFilterHandle) SendLocalResponse(uint32, [][2]string, []byte, string) {}
+func (EmptyHttpFilterHandle) SendResponseHeaders([][2]string, bool)                 {}
+func (EmptyHttpFilterHandle) SendResponseData([]byte, bool)                         {}
+func (EmptyHttpFilterHandle) SendResponseTrailers([][2]string)                      {}
+func (EmptyHttpFilterHandle) AddCustomFlag(string)                                  {}
+func (EmptyHttpFilterHandle) ContinueRequest()                                      {}
+func (EmptyHttpFilterHandle) ContinueResponse()                                     {}
+func (EmptyHttpFilterHandle) ClearRouteCache()                                      {}
+func (EmptyHttpFilterHandle) RefreshRouteCluster()                                  {}
+func (EmptyHttpFilterHandle) RequestHeaders() shared.HeaderMap                      { return nil }
+func (EmptyHttpFilterHandle) BufferedRequestBody() shared.BodyBuffer                { return nil }
+func (EmptyHttpFilterHandle) ReceivedRequestBody() shared.BodyBuffer                { return nil }
+func (EmptyHttpFilterHandle) RequestTrailers() shared.HeaderMap                     { return nil }
+func (EmptyHttpFilterHandle) ResponseHeaders() shared.HeaderMap                     { return nil }
+func (EmptyHttpFilterHandle) BufferedResponseBody() shared.BodyBuffer               { return nil }
+func (EmptyHttpFilterHandle) ReceivedResponseBody() shared.BodyBuffer               { return nil }
+func (EmptyHttpFilterHandle) ReceivedBufferedRequestBody() bool                     { return false }
+func (EmptyHttpFilterHandle) ReceivedBufferedResponseBody() bool                    { return false }
+func (EmptyHttpFilterHandle) ResponseTrailers() shared.HeaderMap                    { return nil }
+func (EmptyHttpFilterHandle) GetMostSpecificConfig() any                            { return nil }
+func (EmptyHttpFilterHandle) GetScheduler() shared.Scheduler                        { return nil }
+func (EmptyHttpFilterHandle) Log(shared.LogLevel, string, ...any)                   {}
 func (EmptyHttpFilterHandle) HttpCallout(string, [][2]string, []byte, uint64, shared.HttpCalloutCallback) (shared.HttpCalloutInitResult, uint64) {
 	return shared.HttpCalloutInitSuccess, 0
 }

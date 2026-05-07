@@ -17,13 +17,13 @@ import (
 )
 
 const (
-	envoyAddr         = "http://localhost:10000" // hello filter
-	envoyEchoAddr     = "http://localhost:10001" // hello-echo direct response
-	envoyStampAddr    = "http://localhost:10002" // resp-stamp (Passthrough)
-	envoyTapAddr      = "http://localhost:10003" // resp-tap (Observe)
-	envoyRewriteAddr  = "http://localhost:10005" // resp-rewrite (Buffer — JSON body rewrite)
-	envoyHStampAddr   = "http://localhost:10006" // resp-header-stamp (Passthrough — add header)
-	adminAddr         = "http://localhost:9901"
+	envoyAddr        = "http://localhost:10000" // hello filter
+	envoyEchoAddr    = "http://localhost:10001" // hello-echo direct response
+	envoyStampAddr   = "http://localhost:10002" // resp-stamp (Passthrough)
+	envoyTapAddr     = "http://localhost:10003" // resp-tap (Observe)
+	envoyRewriteAddr = "http://localhost:10005" // resp-rewrite (Buffer — JSON body rewrite)
+	envoyHStampAddr  = "http://localhost:10006" // resp-header-stamp (Buffer — add header)
+	adminAddr        = "http://localhost:9901"
 )
 
 var (
@@ -313,7 +313,7 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: blackhole }
 
-    # Port 10002 — resp-stamp filter: Passthrough, stamps x-jisr-processed on response.
+    # Port 10002 — resp-stamp filter: Passthrough, inspects response headers.
     - name: resp-stamp
       address:
         socket_address: { address: 0.0.0.0, port_value: 10002 }
