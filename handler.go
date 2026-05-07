@@ -298,9 +298,18 @@ func (r *Request) Log(level shared.LogLevel, format string, args ...any) {
 
 // LogAttrs emits a structured log message to Envoy's logger.
 //
-// The message is encoded as logfmt-style text:
+// The level uses jisr's Envoy-backed log levels ([LogTrace], [LogDebug],
+// [LogInfo], [LogWarn], [LogError], [LogCritical]) so Envoy controls filtering
+// and output. The slog.Attr values provide typed fields only.
+//
+// Fields are encoded as deterministic logfmt-style text:
 //
 //	auth decision filter=auth path=/v1/chat result=allowed
+//
+// In Envoy output the line appears inside Envoy's normal log envelope, for
+// example:
+//
+//	[2026-05-08 06:42:37.984][7221092][info][dynamic_modules] [source/extensions/dynamic_modules/abi_impl.cc:30] auth decision filter=auth path=/v1/chat result=allowed
 //
 // The filter name is included automatically as the first field when available.
 // Avoid logging secrets, raw request bodies, or unbounded high-cardinality

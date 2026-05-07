@@ -109,6 +109,19 @@ func metricsMiddleware(next jisr.ResponseFunc) jisr.ResponseFunc {
 }
 ```
 
+`LogAttrs` uses jisr/Envoy log levels (`LogTrace`, `LogDebug`, `LogInfo`,
+`LogWarn`, `LogError`, `LogCritical`) so Envoy still controls filtering and
+emission. The `log/slog` dependency is used only for typed fields. Jisr encodes
+those fields as deterministic logfmt-style text before handing the message to
+Envoy:
+
+```text
+[2026-05-08 06:42:37.984][7221092][info][dynamic_modules] [source/extensions/dynamic_modules/abi_impl.cc:30] request filter=hello method=GET path=/v1/chat
+```
+
+The `filter` field is added automatically from `r.FilterName` when available.
+String values containing whitespace, quotes, or `=` are quoted.
+
 Middleware runs in the same goroutine as the handler. `context.Context`
 cancellation (client disconnect) propagates through the chain automatically.
 
