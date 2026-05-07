@@ -282,6 +282,26 @@ present should be the `jisr/server.Group` actor goroutines (accept loop,
 stop-channel waiter) and any per-request handlers currently in flight. Zero
 accumulation confirms the channel-based lifecycle is clean.
 
+## Concurrency Invariants
+
+The goroutine bridge is the riskiest part of jisr. Any change to `filter.go`,
+`body.go`, or streaming response handling should preserve these invariants:
+
+| Invariant | Why it matters |
+|-----------|----------------|
+| Every handler goroutine has a bounded exit path | Prevents leaked goroutines after local responses, upstream errors, and disconnects |
+| `OnStreamComplete` cancels context and unblocks body readers | Client disconnects must not leave handlers parked in `Read` or `select` |
+| Envoy worker callbacks never wait indefinitely on user code | Blocking the worker thread stalls unrelated streams on the same worker |
+| Body data channels are never closed to signal EOF | Avoids send-on-closed-channel races between callbacks and handler lifecycle calls |
+| `SkipBody` and `LimitBody` switch future chunks to passthrough | Header-only and head-inspection filters should not keep copying large bodies |
+| Panic recovery always unblocks the Envoy filter chain | A handler panic must not hang the downstream request |
+| New lifecycle behavior gets a race test | Unit success is not enough for callback/goroutine interactions |
+| Disconnect-sensitive behavior gets e2e coverage when possible | Envoy timing differs from the fake test harness |
+
+The preferred pattern is separate ownership for data and lifecycle signals:
+callbacks send chunks, lifecycle paths close cancellation/done signals, and the
+reader translates those signals into `io.EOF`.
+
 ## What You Give Up — and the Escape Hatches
 
 **Full body buffering.** The abstraction always delivers the complete request

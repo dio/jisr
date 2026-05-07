@@ -201,6 +201,18 @@ func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 | `ResponseModeObserve` | streaming | zero | Token counting, logging, SSE tap |
 | `ResponseModeBuffer` | full body | full response | Response rewriting, transformation |
 
+### Which response mode should I use?
+
+| Goal | Mode | Pattern |
+|------|------|---------|
+| Inspect status or headers | `ResponseModePassthrough` | Read `r.StatusCode` / `r.Header`; do not mutate |
+| Emit response metrics | `ResponseModePassthrough` | Record counters/histograms from headers/status only |
+| Count bytes or tokens in SSE/chunked responses | `ResponseModeObserve` | Read `r.Body` while the client receives the stream |
+| Log or sample response body without added latency | `ResponseModeObserve` | Drain or scan `r.Body`; do not mutate |
+| Add or change upstream response headers | `ResponseModeBuffer` | Drain `r.Body`, then call `w.SetUpstreamResponseHeader` |
+| Rewrite JSON or replace the response body | `ResponseModeBuffer` | Read `r.Body`, call `w.ReplaceBody`, and update `content-length` |
+| Avoid body work in a response handler | `Passthrough` or `r.SkipBody()` | Use Passthrough when possible; use `SkipBody` only for inspection, not mutation |
+
 The mode is declared once at registration and never changes at runtime — this lets `OnResponseHeaders` return the correct Envoy status immediately without blocking the worker thread.
 
 ## Struct-based handlers
