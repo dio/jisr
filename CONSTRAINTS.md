@@ -6,6 +6,20 @@ them by running into a wall.
 
 ---
 
+## Response modes
+
+| Goal | Required mode | Notes |
+|------|---------------|-------|
+| Inspect upstream status or headers | `ResponseModePassthrough` | Zero latency; `r.Body` is nil |
+| Emit response metrics from headers/status | `ResponseModePassthrough` | Do not call response mutation APIs |
+| Tap SSE, NDJSON, or chunked bodies | `ResponseModeObserve` | Body is copied to Go while it also flows downstream |
+| Log/sample response body without delaying clients | `ResponseModeObserve` | Read or drain `r.Body`; body mutation is too late |
+| Add or change response headers | `ResponseModeBuffer` | Drain or read `r.Body` before continuing the response |
+| Replace or rewrite response body | `ResponseModeBuffer` | Also update `content-length`; Envoy will not recalculate it |
+| Skip body work after seeing response headers | `ResponseModePassthrough` or `r.SkipBody()` | `SkipBody` is for inspection paths, not reliable header mutation |
+
+---
+
 ## Response header mutation
 
 ### SetUpstreamResponseHeader
