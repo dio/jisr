@@ -82,7 +82,10 @@ A `jisr.Middleware` wraps a `HandlerFunc`; a `jisr.ResponseMiddleware` wraps a
 ```go
 func logging(next jisr.HandlerFunc) jisr.HandlerFunc {
     return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-        r.Log(jisr.LogInfo, "%s %s", r.GetAttr(jisr.AttrRequestMethod), r.GetAttr(jisr.AttrRequestPath))
+        r.LogAttrs(jisr.LogInfo, "request",
+            slog.String("method", r.GetAttr(jisr.AttrRequestMethod)),
+            slog.String("path", r.GetAttr(jisr.AttrRequestPath)),
+        )
         next(ctx, w, r)
     }
 }
@@ -105,6 +108,19 @@ func metricsMiddleware(next jisr.ResponseFunc) jisr.ResponseFunc {
     }
 }
 ```
+
+`LogAttrs` uses jisr/Envoy log levels (`LogTrace`, `LogDebug`, `LogInfo`,
+`LogWarn`, `LogError`, `LogCritical`) so Envoy still controls filtering and
+emission. The `log/slog` dependency is used only for typed fields. Jisr encodes
+those fields as deterministic logfmt-style text before handing the message to
+Envoy:
+
+```text
+[2026-05-08 06:42:37.984][7221092][info][dynamic_modules] [source/extensions/dynamic_modules/abi_impl.cc:30] request filter=hello method=GET path=/v1/chat
+```
+
+The `filter` field is added automatically from `r.FilterName` when available.
+String values containing whitespace, quotes, or `=` are quoted.
 
 Middleware runs in the same goroutine as the handler. `context.Context`
 cancellation (client disconnect) propagates through the chain automatically.
@@ -348,6 +364,7 @@ See [examples/decoder](examples/decoder) for the full runnable example.
 | `r.LimitBody(n)` | Buffer first n bytes, stream the rest zero-copy |
 | `r.GetAttr(id)` | Pre-snapshotted Envoy stream attribute (path, method, host, …) |
 | `r.Log(level, fmt, args...)` | Log via Envoy's logger |
+| `r.LogAttrs(level, msg, attrs...)` | Structured request log via Envoy's logger using `log/slog` attrs |
 
 Available attribute IDs: `jisr.AttrRequestPath`, `AttrRequestMethod`, `AttrRequestHost`, `AttrRequestScheme`, `AttrRequestQuery`, `AttrRequestProtocol`, `AttrRequestID`, `AttrRequestUserAgent`.
 

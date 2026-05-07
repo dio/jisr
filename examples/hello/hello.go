@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -48,7 +49,10 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 		// more direct than parsing pseudo-headers.
 		method := r.GetAttr(jisr.AttrRequestMethod)
 		path := r.GetAttr(jisr.AttrRequestPath)
-		r.Log(jisr.LogInfo, "[%s] %s %s", r.FilterName, method, path)
+		r.LogAttrs(jisr.LogInfo, "hello request",
+			slog.String("method", method),
+			slog.String("path", path),
+		)
 		next(ctx, w, r)
 	}
 }
