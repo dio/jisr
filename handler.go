@@ -60,6 +60,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 
@@ -293,6 +294,22 @@ func (r *Request) LimitBody(n int64) {
 //	r.Log(jisr.LogInfo, "auth ok for key=%s", apiKey)
 func (r *Request) Log(level shared.LogLevel, format string, args ...any) {
 	r.log(level, format, args...)
+}
+
+// LogAttrs emits a structured log message to Envoy's logger.
+//
+// The message is encoded as logfmt-style text:
+//
+//	auth decision filter=auth path=/v1/chat result=allowed
+//
+// The filter name is included automatically as the first field when available.
+// Avoid logging secrets, raw request bodies, or unbounded high-cardinality
+// values unless your log pipeline is explicitly designed for them.
+func (r *Request) LogAttrs(level shared.LogLevel, msg string, attrs ...slog.Attr) {
+	if r.FilterName != "" {
+		attrs = append([]slog.Attr{slog.String("filter", r.FilterName)}, attrs...)
+	}
+	r.log(level, "%s", formatLogAttrs(msg, attrs...))
 }
 
 // ResponseWriter is the interface through which a Handler sends a response

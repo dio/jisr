@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +48,22 @@ func TestHello_PassesThrough(t *testing.T) {
 	assert.Equal(t, "/some/path", body.Path)
 	assert.Equal(t, "test-value", body.Headers["X-Custom"])
 	assert.Equal(t, "from-jisr", body.Headers["X-Hello"])
+}
+
+// TestHello_EmitsStructuredRequestLog verifies that Request.LogAttrs reaches
+// Envoy's logger with deterministic logfmt-style fields.
+func TestHello_EmitsStructuredRequestLog(t *testing.T) {
+	const path = "/structured-log-e2e"
+
+	resp, err := http.Get(envoyAddr + path)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	want := "hello request filter=hello method=GET path=" + path
+	require.Eventually(t, func() bool {
+		return envoyLogs != nil && envoyLogs.contains(want)
+	}, 5*time.Second, 50*time.Millisecond, "missing structured log line %q", want)
 }
 
 // TestEcho_DirectResponse verifies that the hello-echo filter responds

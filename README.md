@@ -82,7 +82,10 @@ A `jisr.Middleware` wraps a `HandlerFunc`; a `jisr.ResponseMiddleware` wraps a
 ```go
 func logging(next jisr.HandlerFunc) jisr.HandlerFunc {
     return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-        r.Log(jisr.LogInfo, "%s %s", r.GetAttr(jisr.AttrRequestMethod), r.GetAttr(jisr.AttrRequestPath))
+        r.LogAttrs(jisr.LogInfo, "request",
+            slog.String("method", r.GetAttr(jisr.AttrRequestMethod)),
+            slog.String("path", r.GetAttr(jisr.AttrRequestPath)),
+        )
         next(ctx, w, r)
     }
 }
@@ -348,6 +351,7 @@ See [examples/decoder](examples/decoder) for the full runnable example.
 | `r.LimitBody(n)` | Buffer first n bytes, stream the rest zero-copy |
 | `r.GetAttr(id)` | Pre-snapshotted Envoy stream attribute (path, method, host, …) |
 | `r.Log(level, fmt, args...)` | Log via Envoy's logger |
+| `r.LogAttrs(level, msg, attrs...)` | Structured request log via Envoy's logger using `log/slog` attrs |
 
 Available attribute IDs: `jisr.AttrRequestPath`, `AttrRequestMethod`, `AttrRequestHost`, `AttrRequestScheme`, `AttrRequestQuery`, `AttrRequestProtocol`, `AttrRequestID`, `AttrRequestUserAgent`.
 

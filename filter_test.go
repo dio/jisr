@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -1299,6 +1300,36 @@ func TestLeak_Log_IsCalled(t *testing.T) {
 		assert.Contains(t, msg, "test message hello")
 	case <-time.After(time.Second):
 		t.Fatal("r.Log() did not call handle.Log")
+	}
+}
+
+func TestRequest_LogAttrs_IsCalled(t *testing.T) {
+	logged := make(chan string, 1)
+
+	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		r.SkipBody()
+		r.LogAttrs(jisr.LogInfo, "auth decision",
+			slog.String("path", "/v1/chat"),
+			slog.String("result", "allowed"),
+			slog.Int("status", http.StatusOK),
+		)
+	})
+
+	h.handle.logFn = func(level shared.LogLevel, msg string) {
+		logged <- msg
+	}
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+
+	select {
+	case msg := <-logged:
+		assert.Equal(t,
+			"auth decision filter=TestRequest_LogAttrs_IsCalled path=/v1/chat result=allowed status=200",
+			msg,
+		)
+	case <-time.After(time.Second):
+		t.Fatal("r.LogAttrs() did not call handle.Log")
 	}
 }
 

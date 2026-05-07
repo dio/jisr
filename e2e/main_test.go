@@ -4,14 +4,18 @@ package e2e
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,10 +33,28 @@ const (
 var (
 	projectRoot  string
 	envoyCmd     *exec.Cmd
+	envoyLogs    *capturedLogs
 	echoServer   *http.Server
 	resetPort    int    // TCP port that accepts then immediately RSTs — upstream reset-before-connect
 	adminPortStr string // "http://127.0.0.1:<port>" of the jisr/prof admin server inside the .so
 )
+
+type capturedLogs struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *capturedLogs) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *capturedLogs) contains(s string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Contains(l.buf.String(), s)
+}
 
 func TestMain(m *testing.M) {
 	_, file, _, _ := runtime.Caller(0)
@@ -80,14 +102,16 @@ func TestMain(m *testing.M) {
 	cfgPath := writeEnvoyConfig(backendPort, resetPort)
 	defer os.Remove(cfgPath)
 
-	envoyCmd = exec.Command(envoyBin, "-c", cfgPath, "--log-level", "warning")
+	envoyCmd = exec.Command(envoyBin, "-c", cfgPath, "--log-level", "warning", "--component-log-level", "dynamic_modules:info")
 	envoyCmd.Env = append(os.Environ(),
 		"GODEBUG=cgocheck=0",
 		"ENVOY_DYNAMIC_MODULES_SEARCH_PATH="+projectRoot,
 		"JISR_ADMIN_PORT_FILE="+portFile.Name(),
 	)
-	envoyCmd.Stdout = os.Stderr
-	envoyCmd.Stderr = os.Stderr
+	envoyLogs = &capturedLogs{}
+	envoyOutput := io.MultiWriter(os.Stderr, envoyLogs)
+	envoyCmd.Stdout = envoyOutput
+	envoyCmd.Stderr = envoyOutput
 	if err := envoyCmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: envoy start failed: %v\n", err)
 		os.Exit(1)

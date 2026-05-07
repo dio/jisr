@@ -40,6 +40,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/dio/jisr"
@@ -108,9 +109,9 @@ func init() {
 // Stateless — defined at package level, no per-config state needed.
 func loggingMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-		r.Log(jisr.LogInfo, "auth: %s %s",
-			r.GetAttr(jisr.AttrRequestMethod),
-			r.GetAttr(jisr.AttrRequestPath),
+		r.LogAttrs(jisr.LogInfo, "auth request",
+			slog.String("method", r.GetAttr(jisr.AttrRequestMethod)),
+			slog.String("path", r.GetAttr(jisr.AttrRequestPath)),
 		)
 		next(ctx, w, r)
 	}
