@@ -48,11 +48,13 @@ type fakeBodyBuffer struct {
 
 func (b *fakeBodyBuffer) GetChunks() []shared.UnsafeEnvoyBuffer { return nil }
 func (b *fakeBodyBuffer) GetSize() uint64 {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return uint64(len(b.data))
 }
 func (b *fakeBodyBuffer) Drain(n uint64) {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if n >= uint64(len(b.data)) {
 		b.data = nil
 	} else {
@@ -60,11 +62,13 @@ func (b *fakeBodyBuffer) Drain(n uint64) {
 	}
 }
 func (b *fakeBodyBuffer) Append(data []byte) {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.data = append(b.data, data...)
 }
 func (b *fakeBodyBuffer) Bytes() []byte {
-	b.mu.Lock(); defer b.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	out := make([]byte, len(b.data))
 	copy(out, b.data)
 	return out
@@ -420,6 +424,41 @@ func TestSkipBody_CalledTwice_NoPanic(t *testing.T) {
 	})
 }
 
+func TestSkipBody_RacesWithOnRequestBody_NoPanic(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		t.Run(fmt.Sprintf("iteration-%d", i), func(t *testing.T) {
+			ready := make(chan struct{})
+			skip := make(chan struct{})
+
+			h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+				close(ready)
+				<-skip
+				r.SkipBody()
+			})
+
+			h.headers(map[string][]string{":path": {"/"}}, false)
+			<-ready
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 32; j++ {
+					h.body([]byte("chunk"), false)
+				}
+				h.body([]byte("last"), true)
+			}()
+			go func() {
+				defer wg.Done()
+				close(skip)
+			}()
+
+			wg.Wait()
+			h.wait(t)
+		})
+	}
+}
+
 func TestSetRequestHeader_AppliedOnContinue(t *testing.T) {
 	h := newHarness(t, func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 		w.SetRequestHeader("x-injected", "yes")
@@ -551,25 +590,31 @@ func newMockWriter() *mockWriter {
 }
 
 func (m *mockWriter) Send(code int, body string) {
-	m.mu.Lock(); defer m.mu.Unlock()
-	m.code = code; m.body = body
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.code = code
+	m.body = body
 }
 func (m *mockWriter) SendBytes(code int, body []byte) {
-	m.mu.Lock(); defer m.mu.Unlock()
-	m.code = code; m.body = string(body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.code = code
+	m.body = string(body)
 }
 func (m *mockWriter) SetRequestHeader(k, v string) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.headers[k] = v
 }
-func (m *mockWriter) SetResponseHeader(_, _ string)                                  {}
-func (m *mockWriter) SetUpstreamResponseHeader(_, _ string)                           {}
-func (m *mockWriter) ReplaceBody(_ []byte)                                            {}
-func (m *mockWriter) ClearRouteCache()                                                {}
-func (m *mockWriter) IncrementCounter(_ jisr.MetricID, _ uint64, _ ...string)        {}
-func (m *mockWriter) RecordHistogram(_ jisr.MetricID, _ uint64, _ ...string)         {}
+func (m *mockWriter) SetResponseHeader(_, _ string)                           {}
+func (m *mockWriter) SetUpstreamResponseHeader(_, _ string)                   {}
+func (m *mockWriter) ReplaceBody(_ []byte)                                    {}
+func (m *mockWriter) ClearRouteCache()                                        {}
+func (m *mockWriter) IncrementCounter(_ jisr.MetricID, _ uint64, _ ...string) {}
+func (m *mockWriter) RecordHistogram(_ jisr.MetricID, _ uint64, _ ...string)  {}
 func (m *mockWriter) SetMetadata(ns, k string, v any) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.meta[ns+"/"+k] = v
 }
 func (m *mockWriter) Stream(_ context.Context, _ [][2]string) (jisr.StreamWriter, error) {
@@ -1180,7 +1225,7 @@ func TestLeak_RegisterRaw_RoundTrip(t *testing.T) {
 
 type fakeRawFactory struct {
 	jisr.EmptyHttpFilterHandle // satisfies shared.HttpFilterConfigFactory via EmptyHttpFilterConfigFactory
-	onCreate func()
+	onCreate                   func()
 }
 
 func (f *fakeRawFactory) Create(_ shared.HttpFilterConfigHandle, _ []byte) (shared.HttpFilterFactory, error) {
@@ -1384,21 +1429,23 @@ func TestOnResponseBody_CtxCancelled_Observe(t *testing.T) {
 	assert.Equal(t, shared.BodyStatusContinue, status)
 }
 
-// TestSetUpstreamResponseHeader_QueuedAndApplied verifies that
+// TestSetUpstreamResponseHeader_Buffer_QueuedAndApplied verifies that
 // SetUpstreamResponseHeader mutations are recorded in rw.respHeaderMuts
 // and applied to ResponseHeaders() during ContinueResponse scheduling.
-func TestSetUpstreamResponseHeader_QueuedAndApplied(t *testing.T) {
+func TestSetUpstreamResponseHeader_Buffer_QueuedAndApplied(t *testing.T) {
 	h := newHarnessWithResponse(t,
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
 		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			io.Copy(io.Discard, r.Body) //nolint:errcheck
 			w.SetUpstreamResponseHeader("x-custom", "injected")
 		},
-		jisr.ResponseModePassthrough,
+		jisr.ResponseModeBuffer,
 	)
 
 	h.headers(map[string][]string{":path": {"/"}}, true)
 	h.wait(t)
-	h.respHeaders(map[string][]string{":status": {"200"}}, true)
+	h.respHeaders(map[string][]string{":status": {"200"}}, false)
+	h.respBody([]byte("body"), true)
 	h.waitResponse(t)
 
 	// The fake ResponseHeaders() returns upstreamRespHdrs.
@@ -1412,6 +1459,67 @@ func TestSetUpstreamResponseHeader_QueuedAndApplied(t *testing.T) {
 
 	assert.Equal(t, "injected", got,
 		"SetUpstreamResponseHeader must be applied via ResponseHeaders().Set()")
+}
+
+func TestSetUpstreamResponseHeader_NoopOutsideBuffer(t *testing.T) {
+	for _, mode := range []jisr.ResponseMode{jisr.ResponseModePassthrough, jisr.ResponseModeObserve} {
+		t.Run(fmt.Sprintf("mode=%d", mode), func(t *testing.T) {
+			done := make(chan struct{})
+			h := newHarnessWithResponse(t,
+				func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+				func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+					if r.Body != nil {
+						r.SkipBody()
+					}
+					w.SetUpstreamResponseHeader("x-custom", "ignored")
+					close(done)
+				},
+				mode,
+			)
+
+			h.headers(map[string][]string{":path": {"/"}}, true)
+			h.wait(t)
+			h.respHeaders(map[string][]string{":status": {"200"}}, true)
+
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("response handler did not complete")
+			}
+
+			h.handle.mu.Lock()
+			var got string
+			if h.handle.upstreamRespHdrs != nil {
+				got = h.handle.upstreamRespHdrs.GetOne("x-custom").ToString()
+			}
+			h.handle.mu.Unlock()
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestReplaceBody_NoopOutsideBuffer(t *testing.T) {
+	h := newHarnessWithResponse(t,
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() },
+		func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Response) {
+			w.ReplaceBody([]byte("ignored"))
+		},
+		jisr.ResponseModePassthrough,
+	)
+
+	h.handle.mu.Lock()
+	h.handle.respBodyBuf = &fakeBodyBuffer{data: []byte("original")}
+	h.handle.mu.Unlock()
+
+	h.headers(map[string][]string{":path": {"/"}}, true)
+	h.wait(t)
+	h.respHeaders(map[string][]string{":status": {"200"}}, true)
+	h.waitResponse(t)
+
+	h.handle.mu.Lock()
+	got := h.handle.respBodyBuf.Bytes()
+	h.handle.mu.Unlock()
+	assert.Equal(t, "original", string(got))
 }
 
 // TestBodyRead_AfterLimitExhausted verifies the remaining<=0 branch in bodyReader.Read —
@@ -1611,6 +1719,19 @@ func TestRegisterFactory_ErrorAbortCreate(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestRegisterFactory_NilHandlerAbortCreate(t *testing.T) {
+	defer jisr.Unregister("fac-nil")
+
+	jisr.RegisterFactory("fac-nil", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+		return nil, nil
+	})
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	_, err := factories["fac-nil"].Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil request handler")
+}
+
 func TestRegisterFactoryWithResponse_ConstructsBothHandlers(t *testing.T) {
 	defer jisr.Unregister("facresp-test")
 
@@ -1640,6 +1761,38 @@ func TestRegisterFactoryWithResponse_ConstructsBothHandlers(t *testing.T) {
 	assert.True(t, s.reqBuilt)
 }
 
+func TestRegisterFactoryWithResponse_NilRequestAbortCreate(t *testing.T) {
+	defer jisr.Unregister("facresp-nil-req")
+
+	jisr.RegisterFactoryWithResponse("facresp-nil-req",
+		func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+			return nil, func(_ context.Context, _ jisr.ResponseWriter, _ *jisr.Response) {}, nil
+		},
+		jisr.ResponseModePassthrough,
+	)
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	_, err := factories["facresp-nil-req"].Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil request handler")
+}
+
+func TestRegisterFactoryWithResponse_NilResponseAbortCreate(t *testing.T) {
+	defer jisr.Unregister("facresp-nil-resp")
+
+	jisr.RegisterFactoryWithResponse("facresp-nil-resp",
+		func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+			return func(_ context.Context, _ jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() }, nil, nil
+		},
+		jisr.ResponseModePassthrough,
+	)
+
+	factories := jisr.WellKnownHttpFilterConfigFactories()
+	_, err := factories["facresp-nil-resp"].Create(jisr.EmptyHttpFilterConfigHandle{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil response handler")
+}
+
 func TestRegisterFactory_PanicOnDuplicate(t *testing.T) {
 	defer jisr.Unregister("fac-dup")
 	jisr.RegisterFactory("fac-dup", func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
@@ -1650,6 +1803,80 @@ func TestRegisterFactory_PanicOnDuplicate(t *testing.T) {
 			return nil, nil
 		})
 	})
+}
+
+func TestRegister_MixedDuplicatePanics(t *testing.T) {
+	req := func(_ context.Context, _ jisr.ResponseWriter, r *jisr.Request) { r.SkipBody() }
+	resp := func(_ context.Context, _ jisr.ResponseWriter, _ *jisr.Response) {}
+
+	registrars := []struct {
+		name string
+		fn   func(string)
+	}{
+		{
+			name: "Register",
+			fn: func(name string) {
+				jisr.Register(name, req)
+			},
+		},
+		{
+			name: "RegisterWithConfig",
+			fn: func(name string) {
+				jisr.RegisterWithConfig(name, nil, req)
+			},
+		},
+		{
+			name: "RegisterWithResponse",
+			fn: func(name string) {
+				jisr.RegisterWithResponse(name, req, resp, jisr.ResponseModePassthrough)
+			},
+		},
+		{
+			name: "RegisterWithConfigAndResponse",
+			fn: func(name string) {
+				jisr.RegisterWithConfigAndResponse(name, nil, req, resp, jisr.ResponseModePassthrough)
+			},
+		},
+		{
+			name: "RegisterFactory",
+			fn: func(name string) {
+				jisr.RegisterFactory(name, func(h jisr.ConfigHandle) (jisr.HandlerFunc, error) {
+					return req, nil
+				})
+			},
+		},
+		{
+			name: "RegisterFactoryWithResponse",
+			fn: func(name string) {
+				jisr.RegisterFactoryWithResponse(name,
+					func(h jisr.ConfigHandle) (jisr.HandlerFunc, jisr.ResponseFunc, error) {
+						return req, resp, nil
+					},
+					jisr.ResponseModePassthrough,
+				)
+			},
+		},
+		{
+			name: "RegisterRaw",
+			fn: func(name string) {
+				jisr.RegisterRaw(name, &fakeRawFactory{onCreate: func() {}})
+			},
+		},
+	}
+
+	for _, first := range registrars {
+		for _, second := range registrars {
+			t.Run(first.name+"_then_"+second.name, func(t *testing.T) {
+				name := strings.ReplaceAll(t.Name(), "/", "_")
+				first.fn(name)
+				t.Cleanup(func() { jisr.Unregister(name) })
+
+				assert.Panics(t, func() {
+					second.fn(name)
+				})
+			})
+		}
+	}
 }
 
 // ── ResponseChain ──────────────────────────────────────────────────────────────

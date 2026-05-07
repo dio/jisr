@@ -47,9 +47,9 @@
 // # How it works
 //
 // Each request spawns one goroutine. [OnRequestHeaders] copies all header data
-// into Go-owned memory, creates a channel-backed [io.Reader] for the body, and
+// into Go-owned memory, creates a pipe-backed [io.Reader] for the body, and
 // returns HeadersStatusStop to suspend the Envoy filter chain. Body chunks pushed
-// by OnRequestBody are forwarded into the channel. When the handler returns,
+// by OnRequestBody are forwarded into the pipe. When the handler returns,
 // [Scheduler.Schedule] hops back onto the Envoy worker thread to apply mutations
 // Client disconnects cancel the context via OnStreamComplete.
 //
@@ -165,7 +165,6 @@ type HandlerFactory func(h ConfigHandle) (HandlerFunc, error)
 //	}
 type ResponseHandlerFactory func(h ConfigHandle) (HandlerFunc, ResponseFunc, error)
 
-
 // (i.e. when Envoy loads the .so). Use it to define metrics and parse config.
 // Return a non-nil error to abort .so load. Envoy will log the error.
 type ConfigFunc func(h ConfigHandle) error
@@ -184,7 +183,6 @@ const (
 	AttrRequestID        = shared.AttributeIDRequestId
 	AttrRequestUserAgent = shared.AttributeIDRequestUserAgent
 )
-
 
 // Use these with [Request.Log] so messages appear in Envoy's log output
 // with the correct level, worker thread ID, and timestamp.
@@ -241,11 +239,11 @@ func (r *Request) GetAttr(id shared.AttributeID) string {
 }
 
 // SkipBody signals jisr that this handler will not read the request body.
-// The body channel is closed immediately (any pending io.ReadAll returns EOF)
+// The body pipe is closed immediately (any pending io.ReadAll returns EOF)
 // and subsequent OnRequestBody calls forward chunks without buffering.
 //
 // Always call SkipBody when you only need headers. Without it, large request
-// bodies will block the Envoy worker thread on the body channel push:
+// bodies will block the Envoy worker thread on the body pipe push:
 //
 //	func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 //	    r.SkipBody()
@@ -324,7 +322,7 @@ type ResponseWriter interface {
 	// Sends the given response headers immediately and returns a [StreamWriter].
 	// The request is NOT forwarded upstream.
 	//
-	// Call r.SkipBody() before Stream; the body channel must not block the
+	// Call r.SkipBody() before Stream; the body pipe must not block the
 	// worker thread while the handler is generating stream output.
 	//
 	// Returns an error if Send/SendBytes was already called, or ctx is done.
@@ -351,12 +349,13 @@ type ResponseWriter interface {
 	// Applied on the Envoy worker thread before ContinueRequest.
 	RecordHistogram(id MetricID, n uint64, labels ...string)
 
-	// SetUpstreamResponseHeader queues a mutation to the upstream response
-	// headers, applied before ContinueResponse. Only valid from a ResponseFunc.
+	// SetUpstreamResponseHeader queues a mutation to upstream response headers.
+	// It is effective only in ResponseModeBuffer and is a no-op in other modes.
 	SetUpstreamResponseHeader(key, value string)
 
-	// ReplaceBody replaces the upstream response body. Only valid in
-	// ResponseModeBuffer. The caller must also set content-length accordingly.
+	// ReplaceBody replaces the upstream response body. It is effective only in
+	// ResponseModeBuffer and is a no-op in other modes. The caller must also set
+	// content-length accordingly.
 	ReplaceBody(body []byte)
 }
 
@@ -412,15 +411,16 @@ type Response struct {
 }
 
 // SkipBody signals jisr that this response handler will not read the response
-// body. The body channel is closed immediately so the goroutine unblocks, and
+// body. The body pipe is closed immediately so the goroutine unblocks, and
 // subsequent OnResponseBody chunks are forwarded to the downstream client
 // without being copied into Go memory.
 //
-// Use when you only need response headers and want to add or inspect them
-// without buffering the body:
+// Use when you only need to inspect response headers without buffering the body.
+// If you need to mutate response headers, use ResponseModeBuffer and drain the
+// body instead so the mutation is applied before ContinueResponse:
 //
 //	func stampHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-//	    r.SkipBody()
+//	    io.Copy(io.Discard, r.Body)
 //	    w.SetUpstreamResponseHeader("x-processed-by", "jisr")
 //	}
 //
@@ -444,20 +444,16 @@ func (r *Response) SkipBody() {
 //
 //	jisr.RegisterWithResponse("my-filter", requestHandler, responseHandler, jisr.ResponseModeObserve)
 func RegisterWithResponse(name string, req HandlerFunc, resp ResponseFunc, mode ResponseMode) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	registry[name] = req
 	respRegistry[name] = resp
 	respModeRegistry[name] = mode
 }
 
-
-//
 // Typical usage:
 //
 //	func authHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
-//	    r.SkipBody() // header-only: skip to avoid blocking on body channel
+//	    r.SkipBody() // header-only: skip to avoid blocking on body pipe
 //	    if r.Header.Get("x-api-key") == "" {
 //	        w.Send(http.StatusUnauthorized, `{"error":"missing api key"}`)
 //	        return
@@ -533,6 +529,34 @@ var factoryRegistry = map[string]HandlerFactory{}
 // respFactRegistry maps filter names to ResponseHandlerFactory functions.
 var respFactRegistry = map[string]ResponseHandlerFactory{}
 
+func filterRegistered(name string) bool {
+	if _, exists := registry[name]; exists {
+		return true
+	}
+	if _, exists := configRegistry[name]; exists {
+		return true
+	}
+	if _, exists := factoryRegistry[name]; exists {
+		return true
+	}
+	if _, exists := respFactRegistry[name]; exists {
+		return true
+	}
+	if _, exists := respRegistry[name]; exists {
+		return true
+	}
+	if _, exists := rawRegistry[name]; exists {
+		return true
+	}
+	return false
+}
+
+func mustRegisterFilter(name string) {
+	if filterRegistered(name) {
+		panic("jisr: filter already registered: " + name)
+	}
+}
+
 // RegisterFactory registers a HandlerFactory for a filter name.
 // The factory is called once when Envoy loads the .so and returns a HandlerFunc
 // constructed from the config context. Use this when the handler needs
@@ -541,12 +565,7 @@ var respFactRegistry = map[string]ResponseHandlerFactory{}
 //
 // See [HandlerFactory] for a full example.
 func RegisterFactory(name string, fn HandlerFactory) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
-	if _, exists := factoryRegistry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	factoryRegistry[name] = fn
 }
 
@@ -556,16 +575,10 @@ func RegisterFactory(name string, fn HandlerFactory) {
 //
 // See [ResponseHandlerFactory] for a full example.
 func RegisterFactoryWithResponse(name string, fn ResponseHandlerFactory, mode ResponseMode) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
-	if _, exists := respFactRegistry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	respFactRegistry[name] = fn
 	respModeRegistry[name] = mode
 }
-
 
 // The ConfigFunc runs once when the .so is loaded. Use it to define Envoy metrics
 // and parse filter config. The HandlerFunc runs per-request.
@@ -591,9 +604,7 @@ func RegisterFactoryWithResponse(name string, fn ResponseHandlerFactory, mode Re
 //	    w.IncrementCounter(requestsTotal, 1, "openai")
 //	}
 func RegisterWithConfig(name string, cfg ConfigFunc, fn HandlerFunc) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	registry[name] = fn
 	configRegistry[name] = cfg
 }
@@ -620,9 +631,7 @@ func RegisterWithConfig(name string, cfg ConfigFunc, fn HandlerFunc) {
 //	    )
 //	}
 func RegisterWithConfigAndResponse(name string, cfg ConfigFunc, req HandlerFunc, resp ResponseFunc, mode ResponseMode) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	registry[name] = req
 	configRegistry[name] = cfg
 	respRegistry[name] = resp
@@ -636,9 +645,7 @@ func RegisterWithConfigAndResponse(name string, cfg ConfigFunc, req HandlerFunc,
 //	    jisr.Register("my-filter", jisr.Chain(myHandler, logging, auth))
 //	}
 func Register(name string, fn HandlerFunc) {
-	if _, exists := registry[name]; exists {
-		panic("jisr: filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	registry[name] = fn
 }
 
@@ -653,9 +660,7 @@ func Register(name string, fn HandlerFunc) {
 //	    jisr.RegisterRaw("sse-passthrough", &rawFactory{}) // raw SDK control
 //	}
 func RegisterRaw(name string, factory shared.HttpFilterConfigFactory) {
-	if _, exists := rawRegistry[name]; exists {
-		panic("jisr: raw filter already registered: " + name)
-	}
+	mustRegisterFilter(name)
 	rawRegistry[name] = factory
 }
 

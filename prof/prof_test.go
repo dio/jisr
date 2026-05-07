@@ -123,7 +123,7 @@ func TestHandler_E2E(t *testing.T) {
 		{"/version", 200, `"module"`},
 		{"/debug/pprof/", 200, "goroutine"},
 		{"/debug/pprof/goroutine?debug=1", 200, "goroutine"},
-		{"/debug/pprof/heap", 200, ""},        // binary, just check 200
+		{"/debug/pprof/heap", 200, ""}, // binary, just check 200
 		{"/debug/pprof/symbol", 200, "num_symbols"},
 	}
 

@@ -79,7 +79,7 @@ func respStampHandler(_ context.Context, _ jisr.ResponseWriter, r *jisr.Response
 // respTapHandler counts upstream response body bytes in Observe mode.
 // ResponseModeObserve: body streams to downstream simultaneously.
 func respTapHandler(_ context.Context, _ jisr.ResponseWriter, r *jisr.Response) {
-	// io.Copy returns when the body channel is closed (eos) or ctx is cancelled
+	// io.Copy returns when the body pipe is closed (eos) or ctx is cancelled
 	// (client/upstream disconnect). Both cases exit cleanly.
 	io.Copy(io.Discard, r.Body) //nolint:errcheck
 }
@@ -111,10 +111,10 @@ func respRewriteHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Respon
 }
 
 // respHeaderStampHandler adds x-jisr-stamp to the upstream response headers
-// using Buffer mode. r.SkipBody() tells jisr not to read the body — it is
-// forwarded to the client unchanged while the goroutine unblocks immediately.
+// using Buffer mode. Draining the body keeps Envoy's buffered response intact
+// while ensuring header mutation happens before the response is continued.
 func respHeaderStampHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
-	r.SkipBody()
+	io.Copy(io.Discard, r.Body) //nolint:errcheck
 	w.SetUpstreamResponseHeader("x-jisr-stamp", strconv.Itoa(r.StatusCode))
 }
 func echoHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {

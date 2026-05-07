@@ -58,10 +58,10 @@ jisr is the bridge between these two worlds.
 
 Each incoming request spawns one goroutine. The raw `OnRequestHeaders`
 callback copies all header data into Go-owned memory (`header.ToString()`),
-creates a channel-backed `io.Reader` for the body, returns `HeadersStatusStop`
+creates a pipe-backed `io.Reader` for the body, returns `HeadersStatusStop`
 to suspend the Envoy filter chain, and starts the goroutine.
 
-Body chunks arrive via `OnRequestBody` and are pushed into the channel. The
+Body chunks arrive via `OnRequestBody` and are pushed into the pipe. The
 goroutine's `io.ReadAll(r.Body)` blocks naturally — no event loop thread is
 held. When the handler returns, `Scheduler.Schedule` hops back onto the Envoy
 worker thread to apply mutations and call `ContinueRequest`. Client disconnects
@@ -78,10 +78,10 @@ block forever.
 
 `HeadersStatusStop` tells Envoy to stop processing headers here but continue
 delivering body callbacks (`OnRequestBody`) as chunks arrive. This feeds the
-channel correctly.
+pipe correctly.
 
 If the handler never reads `r.Body`, the chunks still arrive and get dropped
-(the goroutine exits, the channel is GC'd). This is safe — Envoy only requires
+(the goroutine exits, the pipe is GC'd). This is safe — Envoy only requires
 that `ContinueRequest` or `SendLocalResponse` is eventually called.
 
 ## Why Send, not Write
@@ -216,7 +216,7 @@ fires it in the `Scheduler.Schedule` callback before `ContinueRequest`.
 Each body chunk from Envoy arrives via `OnRequestBody` as an
 `UnsafeEnvoyBuffer`. `ToBytes()` copies it into Go-heap memory — this copy is
 unavoidable because the Envoy C++ side owns the buffer and the Go GC cannot pin
-it. The copy is then sent through the channel to the handler goroutine.
+it. The copy is then sent through the pipe to the handler goroutine.
 
 The original implementation used a `bytes.Buffer` as an intermediate: each
 chunk was written to the buffer on arrival, then read out of the buffer by the
@@ -233,12 +233,25 @@ The remaining copies are irreducible:
 - `ToBytes()`: ABI contract, Go GC cannot pin Envoy memory
 - `copy(p, src)`: `io.Reader` contract, caller provides the destination slice
 
+### Why bodyPipe Uses a Separate Done Signal
+
+jisr does not close the body data channel to signal EOF. Envoy body callbacks,
+handler calls such as `SkipBody` / `LimitBody`, and `OnStreamComplete` can race
+with each other. If one side closes the data channel while another callback is
+sending, Go panics with `send on closed channel`.
+
+Instead, `bodyPipe` keeps the data channel open for the lifetime of the filter
+object and closes a separate `done` channel for EOF, skip, or cancellation.
+Senders select on `done` and stop without panicking. The reader drains any
+already queued chunks before returning `io.EOF`, so natural EOF still delivers
+the final body chunk.
+
 ## LimitBody: Partial Body Inspection
 
 For LLM routing, you need only the first few KB of the request body (enough to
 find the `model` field). `r.LimitBody(n)` caps `r.Body` at `n` bytes. After `n`
-bytes are delivered, `r.Body` returns EOF and the body channel is closed. The
-`headDone` flag tells `OnRequestBody` to switch from channel-push mode to
+bytes are delivered, `r.Body` returns EOF and the body pipe is closed. The
+`headDone` flag tells `OnRequestBody` to switch from pipe-push mode to
 passthrough mode — subsequent chunks are forwarded directly to Envoy without
 being copied into Go memory.
 
@@ -276,7 +289,7 @@ body before the handler runs. Raw SDK filters can process and forward chunks
 before the full body arrives.
 
 *Escape hatch: `r.SkipBody()` and `r.LimitBody(n)`.*
-`SkipBody` closes the body channel immediately and forwards subsequent chunks
+`SkipBody` closes the body pipe immediately and forwards subsequent chunks
 without buffering. `LimitBody(n)` delivers the first `n` bytes, then switches
 to passthrough for the remainder. Zero memory overhead for header-only filters;
 minimal overhead for body-inspecting filters.
@@ -295,7 +308,7 @@ final `endOfStream`.
 ---
 
 **Response header mutation only works in Buffer mode.** `SetUpstreamResponseHeader`
-is silently ignored in Passthrough and Observe modes due to Envoy's header
+is a no-op in Passthrough and Observe modes due to Envoy's header
 forwarding timing (see above).
 
 *Workaround: use `ResponseModeBuffer` and drain the body if you don't need to

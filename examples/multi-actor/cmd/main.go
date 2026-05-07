@@ -6,8 +6,8 @@
 package main
 
 import (
-	_ "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/abi"
 	sdk "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go"
+	_ "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/abi"
 
 	"github.com/dio/jisr"
 	_ "github.com/dio/jisr/examples/multi-actor"

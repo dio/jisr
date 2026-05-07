@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	ssetap "github.com/dio/jisr/examples/sse-tap"
 	"github.com/dio/jisr/buffer"
+	ssetap "github.com/dio/jisr/examples/sse-tap"
 	"github.com/stretchr/testify/assert"
 )
 

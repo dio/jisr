@@ -14,8 +14,8 @@ import (
 
 type configFactory struct {
 	name        string
-	configFn    ConfigFunc    // optional: nil for plain Register (side-effects only)
-	factoryFn   HandlerFactory // optional: returns handler from config context
+	configFn    ConfigFunc             // optional: nil for plain Register (side-effects only)
+	factoryFn   HandlerFactory         // optional: returns handler from config context
 	respFactFn  ResponseHandlerFactory // optional: returns req+resp handler from config context
 	handler     HandlerFunc
 	respHandler ResponseFunc
@@ -36,7 +36,17 @@ func (f *configFactory) Create(
 		// Factory returns both request and response handlers from config context.
 		reqFn, respFn, err := f.respFactFn(ch)
 		if err != nil {
-			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			logConfigError(h, "jisr: filter %q config failed: %v", f.name, err)
+			return nil, err
+		}
+		if reqFn == nil {
+			err := fmt.Errorf("jisr: filter %q factory returned nil request handler", f.name)
+			logConfigError(h, "%v", err)
+			return nil, err
+		}
+		if respFn == nil {
+			err := fmt.Errorf("jisr: filter %q factory returned nil response handler", f.name)
+			logConfigError(h, "%v", err)
 			return nil, err
 		}
 		handler = reqFn
@@ -45,16 +55,26 @@ func (f *configFactory) Create(
 		// Factory returns just the request handler from config context.
 		fn, err := f.factoryFn(ch)
 		if err != nil {
-			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			logConfigError(h, "jisr: filter %q config failed: %v", f.name, err)
+			return nil, err
+		}
+		if fn == nil {
+			err := fmt.Errorf("jisr: filter %q factory returned nil request handler", f.name)
+			logConfigError(h, "%v", err)
 			return nil, err
 		}
 		handler = fn
 	case f.configFn != nil:
 		// Side-effects only (legacy RegisterWithConfig path).
 		if err := f.configFn(ch); err != nil {
-			h.Log(shared.LogLevelError, "jisr: filter %q config failed: %v", f.name, err)
+			logConfigError(h, "jisr: filter %q config failed: %v", f.name, err)
 			return nil, err
 		}
+	}
+	if handler == nil {
+		err := fmt.Errorf("jisr: filter %q has nil request handler", f.name)
+		logConfigError(h, "%v", err)
+		return nil, err
 	}
 
 	return &filterFactory{
@@ -66,6 +86,12 @@ func (f *configFactory) Create(
 }
 
 func (f *configFactory) CreatePerRoute(_ []byte) (any, error) { return nil, nil }
+
+func logConfigError(h shared.HttpFilterConfigHandle, format string, args ...any) {
+	if h != nil {
+		h.Log(shared.LogLevelError, format, args...)
+	}
+}
 
 // --- filterFactory: HttpFilterFactory ---
 
@@ -105,7 +131,7 @@ type handlerFilter struct {
 	cancel    context.CancelFunc
 
 	// request body pipeline
-	bodyCh     chan<- []byte
+	bodyPipe   *bodyPipe
 	bodyReader *bodyReader
 	bodyDone   atomic.Bool // true once endStream seen in OnRequestBody
 	bodySkip   atomic.Bool // true after r.SkipBody(): passthrough mode
@@ -113,7 +139,7 @@ type handlerFilter struct {
 
 	// response pipeline (non-nil only when respHandler != nil)
 	respHeadersCh  chan http.Header // OnResponseHeaders pushes here; goroutine blocks on it
-	respBodyCh     chan<- []byte
+	respBodyPipe   *bodyPipe
 	respBodyReader *bodyReader
 	respBodyDone   atomic.Bool
 	respBodySkip   atomic.Bool // true after r.SkipBody() on Response: pass body through unread
@@ -196,14 +222,20 @@ func (w *responseWriterImpl) SetMetadata(namespace, key string, value any) {
 }
 
 // SetUpstreamResponseHeader queues a mutation to the upstream response headers,
-// applied before ContinueResponse. Only valid from a ResponseFunc.
+// applied before ContinueResponse. Only effective in ResponseModeBuffer.
 func (w *responseWriterImpl) SetUpstreamResponseHeader(key, value string) {
+	if w.filter.respMode != ResponseModeBuffer {
+		return
+	}
 	w.respHeaderMuts = append(w.respHeaderMuts, headerMutation{key, value})
 }
 
-// ReplaceBody replaces the upstream response body. Only valid in Buffer mode.
+// ReplaceBody replaces the upstream response body. Only effective in Buffer mode.
 // The caller is responsible for setting an appropriate content-length response header.
 func (w *responseWriterImpl) ReplaceBody(body []byte) {
+	if w.filter.respMode != ResponseModeBuffer {
+		return
+	}
 	w.replaceBody = body
 	w.bodyReplaced = true
 }
@@ -222,22 +254,18 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 	}
 
 	// Set up request body pipeline.
-	var bodyCh chan<- []byte
-	f.bodyReader, bodyCh = newBodyReader()
-	f.bodyCh = bodyCh
+	f.bodyReader, f.bodyPipe = newBodyReader()
 
 	if endStream {
-		// No body coming: close channel immediately so io.ReadAll returns empty.
-		close(bodyCh)
+		// No body coming: signal EOF immediately so io.ReadAll returns empty.
+		f.bodyPipe.close()
 		f.bodyDone.Store(true)
 	}
 
 	// Set up response pipeline if a ResponseFunc is registered.
 	if f.respHandler != nil {
 		f.respHeadersCh = make(chan http.Header, 1) // buffered: OnResponseHeaders never blocks
-		var respBodyCh chan<- []byte
-		f.respBodyReader, respBodyCh = newBodyReader()
-		f.respBodyCh = respBodyCh
+		f.respBodyReader, f.respBodyPipe = newBodyReader()
 	}
 
 	// Snapshot common Envoy stream attributes: read here on the worker thread
@@ -269,10 +297,11 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 			f.handle.Log(level, format, args...)
 		},
 		skipBody: func() {
-			// CAS prevents double-close. Also check bodyDone: if endStream
-			// was true on headers, bodyCh is already closed.
-			if !f.bodyDone.Load() && f.bodySkip.CompareAndSwap(false, true) {
-				close(bodyCh)
+			// CAS prevents repeated skip work. bodyPipe.close is safe even when
+			// endStream already closed the pipe on headers.
+			if f.bodySkip.CompareAndSwap(false, true) {
+				f.bodyDone.Store(true)
+				f.bodyPipe.close()
 			}
 		},
 		limitBody: func(n int64) {
@@ -280,10 +309,8 @@ func (f *handlerFilter) OnRequestHeaders(headers shared.HeaderMap, endStream boo
 				// Called from the handler goroutine when the limit is reached.
 				// Signal OnRequestBody to stop buffering and stream the rest.
 				f.headDone.Store(true)
-				// Close the channel so the handler's io.ReadAll returns.
-				if !f.bodyDone.Load() && !f.bodySkip.Load() {
-					close(bodyCh)
-				}
+				// Close the pipe so the handler's io.ReadAll returns.
+				f.bodyPipe.close()
 			})
 		},
 	}
@@ -311,18 +338,18 @@ func (f *handlerFilter) OnRequestBody(body shared.BodyBuffer, endStream bool) sh
 		}
 		return shared.BodyStatusContinue
 	}
-	// Push copied chunks into the body channel for the goroutine to consume.
+	// Push copied chunks into the body pipe for the goroutine to consume.
 	for _, chunk := range body.GetChunks() {
 		data := chunk.ToBytes() // copies into Go heap
-		select {
-		case f.bodyCh <- data:
-		case <-f.ctx.Done():
+		if !f.bodyPipe.send(data, f.ctx.Done()) {
 			return shared.BodyStatusContinue
 		}
 	}
 	if endStream {
-		close(f.bodyCh)
-		f.bodyDone.Store(true)
+		// Guard against double-close when Envoy replays the body after extproc buffering.
+		if !f.bodyDone.Swap(true) {
+			f.bodyPipe.close()
+		}
 	}
 	return shared.BodyStatusStopAndBuffer
 }
@@ -340,11 +367,11 @@ func (f *handlerFilter) OnResponseHeaders(headers shared.HeaderMap, endStream bo
 		h.Add(kv[0].ToString(), kv[1].ToString())
 	}
 
-	// If no body follows, close the channel immediately so the goroutine's
+	// If no body follows, signal EOF immediately so the goroutine's
 	// io.ReadAll returns EOF. CAS prevents double-close with OnStreamComplete.
 	if endStream {
 		if f.respBodyDone.CompareAndSwap(false, true) {
-			close(f.respBodyCh)
+			f.respBodyPipe.close()
 		}
 	}
 
@@ -388,15 +415,13 @@ func (f *handlerFilter) OnResponseBody(body shared.BodyBuffer, endStream bool) s
 		// simultaneously forwards the chunk downstream. Zero added latency.
 		for _, chunk := range body.GetChunks() {
 			data := chunk.ToBytes()
-			select {
-			case f.respBodyCh <- data:
-			case <-f.ctx.Done():
+			if !f.respBodyPipe.send(data, f.ctx.Done()) {
 				return shared.BodyStatusContinue
 			}
 		}
 		if endStream {
 			if f.respBodyDone.CompareAndSwap(false, true) {
-				close(f.respBodyCh)
+				f.respBodyPipe.close()
 			}
 		}
 		return shared.BodyStatusContinue
@@ -406,15 +431,13 @@ func (f *handlerFilter) OnResponseBody(body shared.BodyBuffer, endStream bool) s
 		// until the goroutine calls ContinueResponse.
 		for _, chunk := range body.GetChunks() {
 			data := chunk.ToBytes()
-			select {
-			case f.respBodyCh <- data:
-			case <-f.ctx.Done():
+			if !f.respBodyPipe.send(data, f.ctx.Done()) {
 				return shared.BodyStatusContinue
 			}
 		}
 		if endStream {
 			if f.respBodyDone.CompareAndSwap(false, true) {
-				close(f.respBodyCh)
+				f.respBodyPipe.close()
 			}
 		}
 		return shared.BodyStatusStopAndBuffer
@@ -429,18 +452,18 @@ func (f *handlerFilter) OnStreamComplete() {
 	if f.cancel != nil {
 		f.cancel()
 	}
-	// Close request body channel if open: unblocks a handler goroutine
+	// Close request body pipe if open: unblocks a handler goroutine
 	// blocked on r.Body.Read (io.ReadAll) after client disconnect.
-	if f.bodyCh != nil && !f.bodyDone.Load() {
+	if f.bodyPipe != nil && !f.bodyDone.Load() {
 		if f.bodySkip.CompareAndSwap(false, true) {
-			close(f.bodyCh)
+			f.bodyPipe.close()
 		}
 	}
-	// Close response body channel if open: unblocks ResponseFunc reading r.Body.
+	// Close response body pipe if open: unblocks ResponseFunc reading r.Body.
 	// CAS prevents double-close with OnResponseHeaders/OnResponseBody.
-	if f.respBodyCh != nil {
+	if f.respBodyPipe != nil {
 		if f.respBodyDone.CompareAndSwap(false, true) {
-			close(f.respBodyCh)
+			f.respBodyPipe.close()
 		}
 	}
 }
@@ -523,8 +546,8 @@ func (f *handlerFilter) run(req *Request) {
 			// CAS prevents double-close if both SkipBody and OnStreamComplete race.
 			if f.respBodyDone.CompareAndSwap(false, true) {
 				f.respBodySkip.Store(true)
-				if f.respBodyCh != nil {
-					close(f.respBodyCh)
+				if f.respBodyPipe != nil {
+					f.respBodyPipe.close()
 				}
 			}
 		},

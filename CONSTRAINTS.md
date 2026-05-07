@@ -59,9 +59,9 @@ attribute produces an Envoy error log and returns `(nil, false)`.
 | Behavior | Works | Notes |
 |----------|-------|-------|
 | `io.ReadAll(r.Body)` | yes | Blocks until all chunks arrive or context is cancelled |
-| `r.SkipBody()` on `Request` | yes | Closes body channel immediately; subsequent chunks forwarded without buffering. Must call for header-only filters to avoid stalling the worker thread |
+| `r.SkipBody()` on `Request` | yes | Closes the body pipe immediately; subsequent chunks forwarded without buffering. Must call for header-only filters to avoid stalling the worker thread |
 | `r.LimitBody(n)` | yes | Delivers first `n` bytes, then switches to passthrough for the rest. Call before reading `r.Body` |
-| Reading `r.Body` without calling `SkipBody` or `LimitBody` on large bodies | **no** | Worker thread stalls pushing chunks into the channel until the goroutine reads them. Always call `SkipBody` when not reading the body |
+| Reading `r.Body` without calling `SkipBody` or `LimitBody` on large bodies | **no** | Worker thread stalls pushing chunks into the pipe until the goroutine reads them. Always call `SkipBody` when not reading the body |
 | Calling `LimitBody` after starting to read `r.Body` | **no** | Must be called before the first `Read` |
 | Calling both `SkipBody` and `LimitBody` | **no** | Mutually exclusive. `SkipBody` wins if called first (CAS) |
 
@@ -73,9 +73,9 @@ attribute produces an Envoy error log and returns `(nil, false)`.
 |----------|-------|-------|
 | `io.ReadAll(r.Body)` in `ResponseModeBuffer` | yes | Blocks until full body is buffered by Envoy |
 | `io.Copy(io.Discard, r.Body)` to unblock | works but wrong | Unnecessary: use `r.SkipBody()` |
-| `r.SkipBody()` on `Response` | yes | Closes response body channel immediately; `OnResponseBody` switches to passthrough (body forwarded to client unread). Use when you only need headers |
+| `r.SkipBody()` on `Response` | yes | Closes the response body pipe immediately; `OnResponseBody` switches to passthrough (body forwarded to client unread). Use when you only need headers |
 | `r.Body` in `ResponseModePassthrough` | nil | No body is delivered; `r.SkipBody()` is a no-op |
-| `r.Body` in `ResponseModeObserve` | streaming | Read while body flows to client; `r.SkipBody()` closes channel, remaining chunks forwarded |
+| `r.Body` in `ResponseModeObserve` | streaming | Read while body flows to client; `r.SkipBody()` closes the pipe, remaining chunks forwarded |
 
 ---
 

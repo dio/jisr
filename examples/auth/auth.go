@@ -54,10 +54,10 @@ type Config struct {
 // AuthFilter holds per-instance state: parsed config + metric IDs.
 // One instance is created per Envoy listener that uses this filter.
 type AuthFilter struct {
-	cfg      *Config
-	allowed  map[string]struct{} // fast lookup set
-	reqTotal jisr.MetricID       // auth_requests_total{result}
-	respTotal jisr.MetricID      // auth_responses_total{status}
+	cfg       *Config
+	allowed   map[string]struct{} // fast lookup set
+	reqTotal  jisr.MetricID       // auth_requests_total{result}
+	respTotal jisr.MetricID       // auth_responses_total{status}
 }
 
 func init() {
