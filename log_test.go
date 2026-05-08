@@ -22,6 +22,7 @@ func TestFormatLogAttrs(t *testing.T) {
 		slog.Int("status", 200),
 		slog.Int64("delta", -12),
 		slog.Uint64("bytes", 42),
+		slog.Float64("score", 0.9),
 		slog.Bool("cached", true),
 		slog.Duration("latency", 1500*time.Millisecond),
 		slog.Time("time", ts),
@@ -35,7 +36,7 @@ func TestFormatLogAttrs(t *testing.T) {
 	)
 
 	assert.Equal(t,
-		`auth decision path=/v1/chat result=allowed spaced="hello world" quoted="a\"b" empty="" status=200 delta=-12 bytes=42 cached=true latency=1.5s time=2026-05-08T01:02:03.000000004Z error="boom boom" nil=<nil> route.cluster=openai route.attempt=2`,
+		`auth decision path=/v1/chat result=allowed spaced="hello world" quoted="a\"b" empty="" status=200 delta=-12 bytes=42 score=0.9 cached=true latency=1.5s time=2026-05-08T01:02:03.000000004Z error="boom boom" nil=<nil> route.cluster=openai route.attempt=2`,
 		got,
 	)
 }

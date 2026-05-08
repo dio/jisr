@@ -220,6 +220,8 @@ func responseFn(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
 
 ### Which response mode should I use?
 
+This is a quick copy of the authoritative table in [CONSTRAINTS.md](CONSTRAINTS.md#response-modes).
+
 | Goal | Mode | Pattern |
 |------|------|---------|
 | Inspect status or headers | `ResponseModePassthrough` | Read `r.StatusCode` / `r.Header`; do not mutate |

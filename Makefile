@@ -29,7 +29,7 @@ define run-go-all
 endef
 
 .PHONY: all build test fmt-check vet-all test-all race-all tidy tidy-check \
-        build-spa-ui build-examples verify examples e2e clean
+        build-spa-ui build-examples build-e2e-module verify examples e2e clean
 
 all: build test
 
@@ -75,12 +75,15 @@ build-examples: build-spa-ui
 		fi; \
 	done
 
+build-e2e-module:
+	cd e2e && $(GOCMD) build -trimpath -buildmode=c-shared -o libe2e.so ./cmd
+
 verify: fmt-check build-spa-ui vet-all test-all race-all build-examples e2e
 
 examples:
 	$(MAKE) -C examples/hello build
 
-e2e: examples
+e2e: build-e2e-module
 	cd e2e && go test -v -tags e2e -timeout 60s ./...
 
 clean:

@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	collector "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc"
 )
@@ -31,6 +33,7 @@ const (
 	envoyTapAddr     = "http://localhost:10003" // resp-tap (Observe)
 	envoyRewriteAddr = "http://localhost:10005" // resp-rewrite (Buffer — JSON body rewrite)
 	envoyHStampAddr  = "http://localhost:10006" // resp-header-stamp (Buffer — add header)
+	envoyWSProxyAddr = "ws://localhost:10007"   // ws-proxy embedded actor
 	adminAddr        = "http://localhost:9901"
 )
 
@@ -39,8 +42,10 @@ var (
 	envoyCmd     *exec.Cmd
 	envoyLogs    *capturedLogs
 	echoServer   *http.Server
+	wsServer     *http.Server
 	otelServer   *grpc.Server
 	otelMetrics  chan string
+	wsPaths      chan string
 	resetPort    int    // TCP port that accepts then immediately RSTs — upstream reset-before-connect
 	adminPortStr string // "http://127.0.0.1:<port>" of the jisr/prof admin server inside the .so
 )
@@ -64,7 +69,7 @@ func (l *capturedLogs) contains(s string) bool {
 
 func TestMain(m *testing.M) {
 	_, file, _, _ := runtime.Caller(0)
-	projectRoot = filepath.Join(filepath.Dir(file), "..", "examples", "hello")
+	projectRoot = filepath.Dir(file)
 
 	// 1. Start the echo backend on a random free port.
 	backendPort := startEchoBackend()
@@ -73,10 +78,15 @@ func TestMain(m *testing.M) {
 	// Used to simulate upstream connection reset before any data.
 	resetPort = startRSTBackend()
 
-	// 3. Build libhello.so unless JISR_SKIP_BUILD=1.
+	// 3. Start a local WebSocket upstream. The ws-proxy e2e routes through
+	// Envoy -> embedded actor -> this server, never to OpenAI.
+	wsUpstreamPort := startWSProxyMockUpstream()
+	wsProxyLocalPort := reserveTCPPort()
+
+	// 4. Build libe2e.so unless JISR_SKIP_BUILD=1.
 	if os.Getenv("JISR_SKIP_BUILD") == "" {
-		soPath := filepath.Join(projectRoot, "libhello.so")
-		fmt.Fprintln(os.Stderr, "e2e: building libhello.so …")
+		soPath := filepath.Join(projectRoot, "libe2e.so")
+		fmt.Fprintln(os.Stderr, "e2e: building libe2e.so …")
 		cmd := exec.Command("go", "build", "-trimpath", "-buildmode=c-shared", "-o", soPath, "./cmd")
 		cmd.Dir = projectRoot
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
@@ -89,11 +99,11 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: build OK")
 	}
 
-	// 3b. Start a tiny OTLP/gRPC metrics sink so e2e can prove Envoy exports
+	// 4b. Start a tiny OTLP/gRPC metrics sink so e2e can prove Envoy exports
 	// jisr-defined stats through an OpenTelemetry stat sink.
 	otelPort := startOTLPMetricsSink()
 
-	// 4a. Temp file for the admin server port — written by the .so on init.
+	// 5a. Temp file for the admin server port — written by the .so on init.
 	portFile, err := os.CreateTemp("", "jisr-admin-port-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: failed to create port file: %v\n", err)
@@ -102,14 +112,14 @@ func TestMain(m *testing.M) {
 	portFile.Close()
 	defer os.Remove(portFile.Name())
 
-	// 4. Start Envoy with a generated config.
+	// 5. Start Envoy with a generated config.
 	envoyBin := os.Getenv("ENVOY_BIN")
 	if envoyBin == "" {
 		home, _ := os.UserHomeDir()
 		envoyBin = filepath.Join(home, ".local/share/boe/envoy-versions/1.37.1/bin/envoy")
 	}
 
-	cfgPath := writeEnvoyConfig(backendPort, resetPort, otelPort)
+	cfgPath := writeEnvoyConfig(backendPort, resetPort, otelPort, wsUpstreamPort, wsProxyLocalPort)
 	defer os.Remove(cfgPath)
 
 	envoyCmd = exec.Command(envoyBin, "-c", cfgPath, "--log-level", "warning", "--component-log-level", "dynamic_modules:info")
@@ -148,6 +158,7 @@ func TestMain(m *testing.M) {
 	envoyCmd.Process.Kill()
 	envoyCmd.Wait()
 	echoServer.Close()
+	wsServer.Close()
 	otelServer.GracefulStop()
 	os.Exit(code)
 }
@@ -281,6 +292,73 @@ func startRSTBackend() int {
 	return port
 }
 
+// startWSProxyMockUpstream starts a local WebSocket server that speaks the
+// minimal OpenAI Realtime response shape the ws-proxy example taps.
+func startWSProxyMockUpstream() int {
+	wsPaths = make(chan string, 16)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case wsPaths <- r.URL.Path:
+		default:
+		}
+
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		ctx := r.Context()
+		var create struct {
+			Type  string `json:"type"`
+			Model string `json:"model"`
+		}
+		if err := wsjson.Read(ctx, conn, &create); err != nil || create.Type != "response.create" {
+			return
+		}
+
+		send := func(v any) {
+			_ = wsjson.Write(ctx, conn, v)
+		}
+		send(map[string]any{"type": "response.created"})
+		send(map[string]any{"type": "response.output_text.delta", "delta": "local"})
+		send(map[string]any{"type": "response.output_text.delta", "delta": " upstream"})
+		send(map[string]any{"type": "response.output_text.done"})
+		send(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"usage": map[string]any{
+					"input_tokens":  21,
+					"output_tokens": 8,
+				},
+			},
+		})
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: ws mock upstream listen failed: %v\n", err)
+		os.Exit(1)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	wsServer = &http.Server{Handler: mux}
+	go wsServer.Serve(ln)
+	fmt.Fprintf(os.Stderr, "e2e: ws mock upstream listening on 127.0.0.1:%d\n", port)
+	return port
+}
+
+func reserveTCPPort() int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: reserve tcp port failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
 // startOTLPMetricsSink accepts OTLP/gRPC metric export requests from Envoy.
 func startOTLPMetricsSink() int {
 	otelMetrics = make(chan string, 256)
@@ -317,7 +395,7 @@ func (otlpMetricsServer) Export(_ context.Context, req *collector.ExportMetricsS
 }
 
 // writeEnvoyConfig writes a temp envoy config with backend/reset ports substituted.
-func writeEnvoyConfig(backendPort, rstPort, otelPort int) string {
+func writeEnvoyConfig(backendPort, rstPort, otelPort, wsUpstreamPort, wsProxyLocalPort int) string {
 	cfg := fmt.Sprintf(`
 admin:
   address:
@@ -358,7 +436,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: hello
                   - name: envoy.filters.http.router
                     typed_config:
@@ -387,7 +465,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: hello-echo
                   - name: envoy.filters.http.router
                     typed_config:
@@ -416,7 +494,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: resp-stamp
                   - name: envoy.filters.http.router
                     typed_config:
@@ -445,7 +523,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: resp-tap
                   - name: envoy.filters.http.router
                     typed_config:
@@ -474,7 +552,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: resp-tap
                   - name: envoy.filters.http.router
                     typed_config:
@@ -503,7 +581,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: resp-rewrite
                   - name: envoy.filters.http.router
                     typed_config:
@@ -532,7 +610,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
                       dynamic_module_config:
-                        name: hello
+                        name: e2e
                       filter_name: resp-header-stamp
                   - name: envoy.filters.http.router
                     typed_config:
@@ -545,6 +623,48 @@ static_resources:
                       routes:
                         - match: { prefix: "/" }
                           route: { cluster: backend }
+
+    # Port 10007 — ws-proxy embedded actor. Envoy receives the WebSocket
+    # upgrade, then routes it to the HTTP server that ws-proxy started inside
+    # the dynamic module.
+    - name: ws-proxy
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10007 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ws_proxy
+                upgrade_configs:
+                  - upgrade_type: websocket
+                http_filters:
+                  - name: ws-proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        name: e2e
+                      filter_name: ws-proxy
+                      filter_config:
+                        "@type": type.googleapis.com/google.protobuf.StringValue
+                        value: '{"upstream_url":"ws://127.0.0.1:%d","auth_value":"","listen_addr":"127.0.0.1:%d","otel_endpoint":"127.0.0.1:%d","otel_export_interval":"1s"}'
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: ws_proxy
+                  virtual_hosts:
+                    - name: ws-proxy-local
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: upgrade
+                                string_match:
+                                  exact: websocket
+                                  ignore_case: true
+                          route: { cluster: ws_proxy_local }
 
   clusters:
     - name: backend
@@ -594,7 +714,18 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: { address: 127.0.0.1, port_value: %d }
-`, backendPort, rstPort, otelPort)
+
+    # Local embedded actor started by the ws-proxy filter config above.
+    - name: ws_proxy_local
+      type: STATIC
+      load_assignment:
+        cluster_name: ws_proxy_local
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, wsUpstreamPort, wsProxyLocalPort, otelPort, backendPort, rstPort, otelPort, wsProxyLocalPort)
 
 	f, err := os.CreateTemp("", "jisr-e2e-*.yaml")
 	if err != nil {
