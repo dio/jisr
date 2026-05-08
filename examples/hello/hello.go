@@ -67,6 +67,8 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 		if elapsedMs == 0 {
 			elapsedMs = 1
 		}
+		// The hardcoded route tag keeps this example deterministic; production
+		// filters should use a bounded route or cluster label from config.
 		w.RecordHistogram(requestHandlerDurationMs, elapsedMs, "hello")
 	}
 }

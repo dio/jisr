@@ -8,6 +8,9 @@ them by running into a wall.
 
 ## Response modes
 
+This is the authoritative response-mode decision table. README.md keeps a
+shorter user-facing copy; update both if the mode guidance changes.
+
 | Goal | Required mode | Notes |
 |------|---------------|-------|
 | Inspect upstream status or headers | `ResponseModePassthrough` | Zero latency; `r.Body` is nil |
