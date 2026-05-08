@@ -53,33 +53,36 @@ the `.so`.
 
 ## Docker
 
-The Dockerfile produces a self-contained image based on
-`envoyproxy/envoy:distroless-v1.37.1`. It supports both `linux/amd64` and
-`linux/arm64` via a single multi-arch build — no emulation, no separate
-Dockerfiles.
-
-The build uses **zig cc** as the CGO C compiler so the `.so` cross-compiles
-cleanly from any host (macOS, Linux CI) without a native Linux toolchain.
+The Dockerfile is intentionally minimal — it just copies pre-built artifacts
+into `envoyproxy/envoy:distroless-v1.37.1`. All compilation happens on the
+host using `make build-linux`, which cross-compiles via **zig cc** for both
+`linux/amd64` and `linux/arm64` without needing Docker build layers or
+emulation.
 
 ```sh
-# Build and run locally (single arch)
-docker buildx build --platform linux/amd64 --load -t spa:latest .
-docker run --rm -p 10000:10000 spa:latest
-
-# Build and push a multi-arch image
+# One command: cross-compile on host, then package
+make docker                          # loads spa:latest locally
 make docker-push IMAGE_TAG=ghcr.io/you/spa:latest
+
+# Or step by step:
+make build-linux                     # -> libspa.linux-amd64.so + libspa.linux-arm64.so
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --load -t spa:latest .
 ```
 
-The container exposes:
-- `:10000` — Envoy listener (SPA + API)
-- `:9901`  — Envoy admin interface
+```sh
+docker run --rm -p 10000:10000 spa:latest
+curl http://localhost:10000/api/hello
+```
+
+The container exposes `:10000` (SPA + API) and `:9901` (Envoy admin).
 
 ### Why distroless?
 
-`envoyproxy/envoy:distroless-v1.37.1` has no shell, no package manager, no
-OS utilities — just the Envoy binary and its dependencies. Attack surface is
-minimal and the image is small (~50 MB for the Envoy layer). The dynamic
-module `.so` is copied in at `/etc/envoy/libspa.so`.
+`envoyproxy/envoy:distroless-v1.37.1` has no shell, no package manager, no OS
+utilities — just the Envoy binary. The `.so` is copied to `/etc/envoy/libspa.so`
+and loaded at runtime via `ENVOY_DYNAMIC_MODULES_SEARCH_PATH`.
 
 ## Cross-compiled Linux builds (without Docker)
 
