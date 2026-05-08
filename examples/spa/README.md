@@ -7,12 +7,12 @@ an Envoy dynamic module `.so` — no file system access, no separate web server.
 
 | URL | Handled by | Description |
 |-----|-----------|-------------|
-| `/` | `spa` filter | Home page — explains the example |
+| `/` | `spa` filter | Home page |
 | `/about` | `spa` filter → index.html | About page (client-side route) |
 | `/dashboard` | `spa` filter → index.html | Dashboard — calls `/api/time` |
-| `/assets/*` | `spa` filter | Fingerprinted JS/CSS — served with `immutable` cache headers |
-| `/api/hello` | `api-backend` filter | Returns JSON from inside the `.so` |
-| `/api/time` | `api-backend` filter | Returns current UTC time from inside the `.so` |
+| `/assets/*` | `spa` filter | Fingerprinted JS/CSS with `immutable` cache headers |
+| `/api/hello` | `api-backend` filter | JSON from inside the `.so` |
+| `/api/time` | `api-backend` filter | Current UTC time from inside the `.so` |
 | `/*` (unknown) | `spa` filter → index.html | SPA fallback — React Router renders a 404 component |
 
 Refreshing on `/about` or `/dashboard` works because the filter returns
@@ -26,7 +26,7 @@ then renders the correct component client-side.
 | `spa` | Serves embedded `ui/dist` assets; falls back to `index.html` for SPA routing |
 | `api-backend` | Handles `/api/*` directly from Go — no upstream cluster needed |
 
-## Build
+## Build (local, macOS / Linux)
 
 ```sh
 # Full build: install npm deps, run vite build, compile .so
@@ -37,7 +37,9 @@ make ui        # npm install (if needed) + vite build
 make build-so  # compile the .so only (ui/dist must already exist)
 ```
 
-## Run
+Requires Node.js >= 18 and Go with CGO enabled.
+
+## Run (local)
 
 ```sh
 make          # build ui + .so
@@ -45,11 +47,61 @@ ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
 # open http://localhost:10000
 ```
 
-Requires Node.js ≥ 18 and Go with CGO enabled.
-
 The Vite build output in `ui/dist/` is embedded into the `.so` at Go compile
 time via `//go:embed ui/dist`. Rebuilding the frontend requires recompiling
 the `.so`.
+
+## Docker
+
+The Dockerfile produces a self-contained image based on
+`envoyproxy/envoy:distroless-v1.37.1`. It supports both `linux/amd64` and
+`linux/arm64` via a single multi-arch build — no emulation, no separate
+Dockerfiles.
+
+The build uses **zig cc** as the CGO C compiler so the `.so` cross-compiles
+cleanly from any host (macOS, Linux CI) without a native Linux toolchain.
+
+```sh
+# Build and run locally (single arch)
+docker buildx build --platform linux/amd64 --load -t spa:latest .
+docker run --rm -p 10000:10000 spa:latest
+
+# Build and push a multi-arch image
+make docker-push IMAGE_TAG=ghcr.io/you/spa:latest
+```
+
+The container exposes:
+- `:10000` — Envoy listener (SPA + API)
+- `:9901`  — Envoy admin interface
+
+### Why distroless?
+
+`envoyproxy/envoy:distroless-v1.37.1` has no shell, no package manager, no
+OS utilities — just the Envoy binary and its dependencies. Attack surface is
+minimal and the image is small (~50 MB for the Envoy layer). The dynamic
+module `.so` is copied in at `/etc/envoy/libspa.so`.
+
+## Cross-compiled Linux builds (without Docker)
+
+If you need the `.so` files separately (e.g. to copy into an existing Envoy
+deployment), you can cross-compile from macOS or Linux using zig:
+
+```sh
+# Requires zig 0.16.0 at /tmp/zig-aarch64-macos-0.16.0/zig
+# Override with: make build-linux ZIG=/path/to/zig
+
+make build-linux-amd64   # -> libspa.linux-amd64.so
+make build-linux-arm64   # -> libspa.linux-arm64.so
+make build-linux         # both
+```
+
+On the target machine, copy the `.so` alongside `envoy.yaml` and run:
+
+```sh
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=/path/to/dir \
+GODEBUG=cgocheck=0 \
+envoy -c envoy.yaml
+```
 
 ## Development workflow
 
@@ -68,14 +120,24 @@ without CORS issues. Edit any `.tsx` file and the browser reloads instantly.
 When you're happy with changes, run `make` to rebuild the `.so` with the new
 embedded assets.
 
+## E2E tests
+
+Tests use [Lightpanda](https://lightpanda.io) (headless browser) and
+playwright-core over CDP. Envoy must be running first.
+
+```sh
+make          # build
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml &
+make e2e      # 13 tests, ~1.5s
+```
+
 ## Clean
 
 ```sh
-make clean   # removes libspa.so and ui/dist/
+make clean   # removes libspa.so, cross-compiled .so files, and ui/dist/
 ```
 
-`ui/node_modules/` and `ui/dist/` are gitignored — run `make` from scratch
-on a fresh clone.
+`ui/node_modules/`, `ui/dist/`, and `e2e/node_modules/` are gitignored.
 
 ## Cache strategy
 
@@ -93,3 +155,4 @@ on a fresh clone.
 - Two filters in one `.so` sharing the same embedded filesystem
 - `jisr.Chain` with logging middleware on the API filter
 - Vite dev proxy (`/api` → Envoy) for a smooth development loop
+- Multi-arch Docker packaging via zig cc cross-compilation + distroless Envoy base
