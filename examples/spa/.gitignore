@@ -1,3 +1,4 @@
 libspa.so
 libspa.h
 ui/node_modules/
+.bin/
