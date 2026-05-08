@@ -56,6 +56,7 @@ CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o libmyfilter.so ./cmd
 |----------|----------|
 | [RATIONALE.md](RATIONALE.md) | Why jisr exists; design decisions behind the goroutine model, response modes, zero-copy body, metrics, ClearRouteCache, and escape hatches |
 | [CONSTRAINTS.md](CONSTRAINTS.md) | What works, what doesn't, and why — tested against Envoy 1.37.1. Response header mutation, attribute support, body rules, metrics, SDK naming, go.work |
+| [e2e/README.md](e2e/README.md) | What the real-Envoy e2e suite covers, including logs, dynamic metadata, Envoy stats, and OTel metric export |
 
 ## Middleware
 
@@ -327,6 +328,9 @@ func decoderRequest(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
     w.SetMetadata("router", "cluster", cluster)
     w.ClearRouteCache() // re-evaluate cluster_header route with new x-cluster value
     w.IncrementCounter(requestsTotal, 1, cluster)
+    r.LogAttrs(jisr.LogInfo, "route decision",
+        slog.String("cluster", cluster),
+    )
 }
 
 func decoderResponse(_ context.Context, w jisr.ResponseWriter, r *jisr.Response) {
@@ -334,6 +338,80 @@ func decoderResponse(_ context.Context, w jisr.ResponseWriter, r *jisr.Response)
     w.RecordHistogram(ttftMs, measureTTFT(), cluster)
 }
 ```
+
+Metrics and logs should share the same bounded dimensions (`cluster`, `result`,
+`status`, route names), but metric emission must not depend on log verbosity.
+If Envoy suppresses an info log, `w.IncrementCounter` and `w.RecordHistogram`
+still run and the signal remains available for alerts.
+
+Use counters for event volume and histograms for latency or size distributions.
+For example, a request middleware can record handler duration after the wrapped
+handler returns:
+
+```go
+func observe(next jisr.HandlerFunc) jisr.HandlerFunc {
+    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+        start := time.Now()
+        next(ctx, w, r)
+
+        ms := uint64(time.Since(start).Milliseconds())
+        if ms == 0 {
+            ms = 1
+        }
+        w.RecordHistogram(requestHandlerDurationMs, ms, "hello")
+    }
+}
+```
+
+Jisr also works with Envoy access logs. Use `w.SetMetadata` for values that
+Envoy should render with `%DYNAMIC_METADATA(namespace:key)%`:
+
+```yaml
+access_log:
+  - name: envoy.access_loggers.stderr
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog
+      log_format:
+        text_format_source:
+          inline_string: "cluster=%DYNAMIC_METADATA(router:cluster)%\n"
+```
+
+To export jisr-defined metrics to OpenTelemetry, configure Envoy's
+OpenTelemetry stat sink. Jisr still records Envoy-native stats; Envoy handles
+the OTLP export:
+
+```yaml
+stats_flush_interval: 1s
+stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig
+      grpc_service:
+        envoy_grpc:
+          cluster_name: otel_collector
+      report_counters_as_deltas: true
+      emit_tags_as_attributes: true
+
+static_resources:
+  clusters:
+    - name: otel_collector
+      type: STRICT_DNS
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: otel_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 4317 }
+```
+
+For local testing, point the cluster at any OTLP/gRPC receiver, such as a local
+OpenTelemetry Collector or `otel-front`.
 
 See [examples/decoder](examples/decoder) for the full runnable example.
 

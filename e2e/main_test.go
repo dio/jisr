@@ -5,6 +5,7 @@ package e2e
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	collector "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -35,6 +39,8 @@ var (
 	envoyCmd     *exec.Cmd
 	envoyLogs    *capturedLogs
 	echoServer   *http.Server
+	otelServer   *grpc.Server
+	otelMetrics  chan string
 	resetPort    int    // TCP port that accepts then immediately RSTs — upstream reset-before-connect
 	adminPortStr string // "http://127.0.0.1:<port>" of the jisr/prof admin server inside the .so
 )
@@ -83,6 +89,10 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: build OK")
 	}
 
+	// 3b. Start a tiny OTLP/gRPC metrics sink so e2e can prove Envoy exports
+	// jisr-defined stats through an OpenTelemetry stat sink.
+	otelPort := startOTLPMetricsSink()
+
 	// 4a. Temp file for the admin server port — written by the .so on init.
 	portFile, err := os.CreateTemp("", "jisr-admin-port-*")
 	if err != nil {
@@ -99,7 +109,7 @@ func TestMain(m *testing.M) {
 		envoyBin = filepath.Join(home, ".local/share/boe/envoy-versions/1.37.1/bin/envoy")
 	}
 
-	cfgPath := writeEnvoyConfig(backendPort, resetPort)
+	cfgPath := writeEnvoyConfig(backendPort, resetPort, otelPort)
 	defer os.Remove(cfgPath)
 
 	envoyCmd = exec.Command(envoyBin, "-c", cfgPath, "--log-level", "warning", "--component-log-level", "dynamic_modules:info")
@@ -138,6 +148,7 @@ func TestMain(m *testing.M) {
 	envoyCmd.Process.Kill()
 	envoyCmd.Wait()
 	echoServer.Close()
+	otelServer.GracefulStop()
 	os.Exit(code)
 }
 
@@ -270,12 +281,58 @@ func startRSTBackend() int {
 	return port
 }
 
+// startOTLPMetricsSink accepts OTLP/gRPC metric export requests from Envoy.
+func startOTLPMetricsSink() int {
+	otelMetrics = make(chan string, 256)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: otlp metrics sink listen failed: %v\n", err)
+		os.Exit(1)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	otelServer = grpc.NewServer()
+	collector.RegisterMetricsServiceServer(otelServer, otlpMetricsServer{})
+	go otelServer.Serve(ln)
+	fmt.Fprintf(os.Stderr, "e2e: otlp metrics grpc sink listening on 127.0.0.1:%d\n", port)
+	return port
+}
+
+type otlpMetricsServer struct {
+	collector.UnimplementedMetricsServiceServer
+}
+
+func (otlpMetricsServer) Export(_ context.Context, req *collector.ExportMetricsServiceRequest) (*collector.ExportMetricsServiceResponse, error) {
+	for _, rm := range req.ResourceMetrics {
+		for _, sm := range rm.ScopeMetrics {
+			for _, metric := range sm.Metrics {
+				select {
+				case otelMetrics <- metric.Name:
+				default:
+				}
+			}
+		}
+	}
+	return &collector.ExportMetricsServiceResponse{}, nil
+}
+
 // writeEnvoyConfig writes a temp envoy config with backend/reset ports substituted.
-func writeEnvoyConfig(backendPort, rstPort int) string {
+func writeEnvoyConfig(backendPort, rstPort, otelPort int) string {
 	cfg := fmt.Sprintf(`
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+stats_flush_interval: 1s
+stats_sinks:
+  - name: envoy.stat_sinks.open_telemetry
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.stat_sinks.open_telemetry.v3.SinkConfig
+      grpc_service:
+        envoy_grpc:
+          cluster_name: otel_collector
+      report_counters_as_deltas: true
+      emit_tags_as_attributes: true
 
 static_resources:
   listeners:
@@ -289,6 +346,13 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress
+                access_log:
+                  - name: envoy.access_loggers.stderr
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "access dynamic_metadata_filter=%%DYNAMIC_METADATA(jisr:filter)%% dynamic_metadata_route=%%DYNAMIC_METADATA(jisr:route)%%\n"
                 http_filters:
                   - name: hello
                     typed_config:
@@ -514,7 +578,23 @@ static_resources:
               - endpoint:
                   address:
                     socket_address: { address: 127.0.0.1, port_value: 1 }
-`, backendPort, rstPort)
+
+    # Local OTLP/gRPC sink used by the e2e tests.
+    - name: otel_collector
+      type: STATIC
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: otel_collector
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: %d }
+`, backendPort, rstPort, otelPort)
 
 	f, err := os.CreateTemp("", "jisr-e2e-*.yaml")
 	if err != nil {
