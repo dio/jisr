@@ -100,6 +100,35 @@ docker-push: build-linux
 	  --push \
 	  -t $(IMAGE_TAG) .
 
+## smoke: run the image locally and verify all endpoints respond correctly
+## Builds a local amd64 image first if IMAGE_TAG is the default.
+smoke: _smoke-build
+	@echo "--- starting container..."
+	@docker run -d --rm --name spa-smoke -p 10002:10000 $(IMAGE_TAG)
+	@trap 'docker stop spa-smoke 2>/dev/null; exit' INT TERM; \
+	for i in $$(seq 1 10); do \
+	  curl -sf http://localhost:10002/ >/dev/null 2>&1 && break; \
+	  sleep 1; \
+	done
+	@echo "--- GET / (expect 200 HTML)"
+	@curl -sf -o /dev/null -w "  %{http_code} %{content_type}\n" http://localhost:10002/
+	@echo "--- GET /about (expect 200 HTML, SPA fallback)"
+	@curl -sf -o /dev/null -w "  %{http_code} %{content_type}\n" http://localhost:10002/about
+	@echo "--- GET /api/hello (expect 200 JSON)"
+	@curl -sf http://localhost:10002/api/hello | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['filter']=='api-backend'; print(' ', d)"
+	@echo "--- GET /api/time (expect 200 JSON with timestamp)"
+	@curl -sf http://localhost:10002/api/time | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'T' in d['time']; print(' ', d)"
+	@echo "--- GET /api/unknown (expect 404)"
+	@curl -sf -o /dev/null -w "  %{http_code}\n" http://localhost:10002/api/unknown || true
+	@echo "--- all checks passed"
+	@docker stop spa-smoke
+
+_smoke-build:
+	@if [ "$(IMAGE_TAG)" = "spa:latest" ]; then \
+	  docker buildx build --platform linux/amd64 --load -t $(IMAGE_TAG) . 2>/dev/null || \
+	  docker buildx build --platform linux/arm64 --load -t $(IMAGE_TAG) .; \
+	fi
+
 ## clean: remove .so files, cross-compiled outputs, and built frontend assets
 clean:
 	rm -f $(OUTPUT) $(OUTPUT:.so=.h) libspa.linux-amd64.so libspa.linux-arm64.so

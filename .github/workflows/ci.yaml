@@ -123,5 +123,8 @@ jobs:
           push: true
           tags: ttl.sh/jisr-spa-${{ github.sha }}:1h
 
+      - name: smoke test
+        run: make -C examples/spa smoke IMAGE_TAG=ttl.sh/jisr-spa-${{ github.sha }}:1h
+
       - name: image summary
         run: echo "ttl.sh/jisr-spa-${{ github.sha }}:1h" >> $GITHUB_STEP_SUMMARY
