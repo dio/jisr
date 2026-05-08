@@ -31,6 +31,12 @@ $(NM): $(UI_DIR)/package.json
 dev:
 	cd $(UI_DIR) && npm run dev
 
+## e2e: run end-to-end browser tests (requires Envoy to be running on :10000)
+## Uses Lightpanda (headless browser) + Puppeteer via CDP.
+## Start Envoy first:  ENVOY_DYNAMIC_MODULES_SEARCH_PATH=$(pwd) envoy -c envoy.yaml
+e2e:
+	cd e2e && node --test spa.test.mjs
+
 ## clean: remove the .so and built frontend assets
 clean:
 	rm -f $(OUTPUT) $(OUTPUT:.so=.h)
