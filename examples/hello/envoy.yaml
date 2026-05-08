@@ -13,6 +13,13 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress
+                access_log:
+                  - name: envoy.access_loggers.stderr
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "access dynamic_metadata_filter=%DYNAMIC_METADATA(jisr:filter)% dynamic_metadata_route=%DYNAMIC_METADATA(jisr:route)%\n"
                 http_filters:
                   - name: hello
                     typed_config:

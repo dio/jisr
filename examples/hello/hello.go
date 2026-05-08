@@ -62,6 +62,8 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 func helloHandler(_ context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	r.SkipBody()
 	w.SetRequestHeader("x-hello", "from-jisr")
+	w.SetMetadata("jisr", "filter", r.FilterName)
+	w.SetMetadata("jisr", "route", "hello")
 	w.IncrementCounter(requestsTotal, 1)
 }
 
