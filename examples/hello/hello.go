@@ -7,14 +7,16 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/dio/jisr"
 )
 
 // Metrics defined once at config time, incremented per-request.
 var (
-	requestsTotal jisr.MetricID
-	echoTotal     jisr.MetricID
+	requestsTotal            jisr.MetricID
+	requestHandlerDurationMs jisr.MetricID
+	echoTotal                jisr.MetricID
 )
 
 func init() {
@@ -22,6 +24,10 @@ func init() {
 		func(h jisr.ConfigHandle) error {
 			var err error
 			requestsTotal, err = h.DefineCounter("hello_requests_total")
+			if err != nil {
+				return err
+			}
+			requestHandlerDurationMs, err = h.DefineHistogram("hello_request_handler_duration_ms", "route")
 			return err
 		},
 		jisr.Chain(helloHandler, logMiddleware),
@@ -45,6 +51,8 @@ func init() {
 
 func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 	return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+		start := time.Now()
+
 		// Use GetAttr for path and method: snapshotted on the worker thread,
 		// more direct than parsing pseudo-headers.
 		method := r.GetAttr(jisr.AttrRequestMethod)
@@ -54,6 +62,12 @@ func logMiddleware(next jisr.HandlerFunc) jisr.HandlerFunc {
 			slog.String("path", path),
 		)
 		next(ctx, w, r)
+
+		elapsedMs := uint64(time.Since(start).Milliseconds())
+		if elapsedMs == 0 {
+			elapsedMs = 1
+		}
+		w.RecordHistogram(requestHandlerDurationMs, elapsedMs, "hello")
 	}
 }
 

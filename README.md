@@ -344,6 +344,25 @@ Metrics and logs should share the same bounded dimensions (`cluster`, `result`,
 If Envoy suppresses an info log, `w.IncrementCounter` and `w.RecordHistogram`
 still run and the signal remains available for alerts.
 
+Use counters for event volume and histograms for latency or size distributions.
+For example, a request middleware can record handler duration after the wrapped
+handler returns:
+
+```go
+func observe(next jisr.HandlerFunc) jisr.HandlerFunc {
+    return func(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
+        start := time.Now()
+        next(ctx, w, r)
+
+        ms := uint64(time.Since(start).Milliseconds())
+        if ms == 0 {
+            ms = 1
+        }
+        w.RecordHistogram(requestHandlerDurationMs, ms, "hello")
+    }
+}
+```
+
 Jisr also works with Envoy access logs. Use `w.SetMetadata` for values that
 Envoy should render with `%DYNAMIC_METADATA(namespace:key)%`:
 

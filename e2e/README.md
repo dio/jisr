@@ -27,8 +27,8 @@ disconnect handling, and observability paths:
 | Local response | `hello-echo` responds with JSON without hitting upstream |
 | Structured logs | `Request.LogAttrs` reaches Envoy's `dynamic_modules` logger |
 | Dynamic metadata logs | `w.SetMetadata` values render through Envoy access-log `%DYNAMIC_METADATA(...)%` |
-| Envoy stats | `hello_requests_total` increments in `/stats` after a request |
-| OpenTelemetry export | Envoy exports `hello_requests_total` to an in-process OTLP/gRPC metrics sink |
+| Envoy stats | `hello_requests_total` increments and `hello_request_handler_duration_ms` appears in `/stats` after a request |
+| OpenTelemetry export | Envoy exports the hello counter and histogram to an in-process OTLP/gRPC metrics sink |
 | Response modes | Passthrough, Observe, and Buffer response handlers run against real upstream responses |
 | Disconnects | Client and upstream disconnect cases do not deadlock or leak the filter chain |
 | Admin server | The embedded jisr/prof admin server exposes health, readiness, version, and pprof endpoints |
@@ -42,10 +42,12 @@ Envoy, not for a synthetic fake-harness message.
 The metrics tests use two independent paths:
 
 1. `GET /stats?filter=hello_requests_total` proves the counter exists in
-   Envoy's native stats store and increases after a request.
+   Envoy's native stats store and increases after a request. A second stats
+   assertion checks that the handler-duration histogram appears after an
+   observation is recorded.
 2. A small OTLP/gRPC metrics service receives Envoy's OpenTelemetry stat sink
-   exports and records exported metric names. This proves a jisr-defined metric
-   can leave Envoy through an OTel sink.
+   exports and records exported metric names. This proves jisr-defined counters
+   and histograms can leave Envoy through an OTel sink.
 
 The dynamic metadata test uses an Envoy access log configured with:
 

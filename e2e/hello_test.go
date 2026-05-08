@@ -103,6 +103,21 @@ func TestHello_IncrementsEnvoyCounter(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond, "counter %q did not increase from %d", metric, before)
 }
 
+// TestHello_RecordsEnvoyHistogram verifies that histogram observations recorded
+// by jisr are visible in Envoy's native stats store.
+func TestHello_RecordsEnvoyHistogram(t *testing.T) {
+	const metric = "hello_request_handler_duration_ms"
+
+	resp, err := http.Get(envoyAddr + "/histogram-e2e")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.Eventually(t, func() bool {
+		return envoyStatsContains(metric)
+	}, 5*time.Second, 50*time.Millisecond, "histogram %q did not appear in Envoy stats", metric)
+}
+
 // TestHello_ExportsCounterToOTelSink verifies that Envoy can export a
 // jisr-defined counter through its OpenTelemetry stat sink.
 func TestHello_ExportsCounterToOTelSink(t *testing.T) {
@@ -118,6 +133,23 @@ func TestHello_ExportsCounterToOTelSink(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return sawOTelMetric(metric)
 	}, 8*time.Second, 100*time.Millisecond, "OTel sink did not receive metric %q", metric)
+}
+
+// TestHello_ExportsHistogramToOTelSink verifies that Envoy can export a
+// jisr-defined histogram through its OpenTelemetry stat sink.
+func TestHello_ExportsHistogramToOTelSink(t *testing.T) {
+	const metric = "hello_request_handler_duration_ms"
+
+	drainOTelMetrics()
+
+	resp, err := http.Get(envoyAddr + "/otel-histogram-e2e")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.Eventually(t, func() bool {
+		return sawOTelMetric(metric)
+	}, 8*time.Second, 100*time.Millisecond, "OTel sink did not receive histogram %q", metric)
 }
 
 // TestEcho_DirectResponse verifies that the hello-echo filter responds
@@ -188,6 +220,25 @@ func readEnvoyCounter(name string) (uint64, bool) {
 		return 0, false
 	}
 	return max, found
+}
+
+func envoyStatsContains(name string) bool {
+	resp, err := http.Get(adminAddr + "/stats?filter=" + url.QueryEscape(name))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func drainOTelMetrics() {

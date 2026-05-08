@@ -43,16 +43,19 @@ curl -X POST http://localhost:10001/ping \
 
 ## Metrics and dynamic metadata
 
-The `hello` filter records an Envoy-native counter on every forwarded request:
+The `hello` filter records an Envoy-native counter on every forwarded request
+and a histogram observation for handler duration:
 
 ```go
 w.IncrementCounter(requestsTotal, 1)
+w.RecordHistogram(requestHandlerDurationMs, elapsedMs, "hello")
 ```
 
 Query it through Envoy admin:
 
 ```sh
 curl -s 'http://localhost:9901/stats?filter=hello_requests_total'
+curl -s 'http://localhost:9901/stats?filter=hello_request_handler_duration_ms'
 ```
 
 The filter also sets dynamic metadata:
@@ -68,7 +71,8 @@ The example Envoy config renders those values in the access log:
 access dynamic_metadata_filter=hello dynamic_metadata_route=hello
 ```
 
-To send the same `hello_requests_total` counter to an OpenTelemetry sink, add an
+To send the same `hello_requests_total` counter and
+`hello_request_handler_duration_ms` histogram to an OpenTelemetry sink, add an
 Envoy OpenTelemetry stat sink and point it at an OTLP/gRPC receiver. For local
 testing, run an OpenTelemetry Collector or `otel-front`, then add:
 
@@ -103,7 +107,8 @@ static_resources:
 ```
 
 With `otel-front`, open the local UI and search metrics for
-`hello_requests_total` after sending a request through Envoy.
+`hello_requests_total` and `hello_request_handler_duration_ms` after sending a
+request through Envoy.
 
 ## Admin server
 
@@ -122,6 +127,7 @@ to a file (used by the e2e test harness).
 ## What this demonstrates
 
 - `RegisterWithConfig` for defining Envoy counters at `.so` load time
+- `w.RecordHistogram` for latency-style distribution metrics
 - Envoy OpenTelemetry stat sink export for jisr-defined counters
 - `w.SetMetadata` with Envoy access-log `%DYNAMIC_METADATA(...)%`
 - `RegisterWithResponse` with all three modes (Passthrough / Observe / Buffer)
