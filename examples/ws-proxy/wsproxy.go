@@ -33,9 +33,11 @@ package wsproxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -72,14 +74,40 @@ func (f *rawConfigFactory) Create(
 		}
 	}
 
-	srv, stop, err := server.New(proxy, timeout)
+	var actorObs *actorObservability
+	if cfg.OTELEndpoint != "" {
+		var err error
+		actorObs, err = newActorObservability(context.Background(), cfg.OTELEndpoint, cfg.OTELExportInterval)
+		if err != nil {
+			handle.Log(shared.LogLevelError, "ws-proxy: actor observability failed: %v", err)
+			return nil, fmt.Errorf("ws-proxy observability: %w", err)
+		}
+		handle.Log(shared.LogLevelInfo, "ws-proxy: actor metrics exporting to %s", cfg.OTELEndpoint)
+	}
+
+	listenAddr := cfg.ListenAddress
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:0"
+	}
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		handle.Log(shared.LogLevelError, "ws-proxy: start failed: %v", err)
 		return nil, fmt.Errorf("ws-proxy: %w", err)
 	}
 
+	group := server.NewGroup()
+	srv := group.AddListener(ln, proxy, timeout)
+	group.Start()
+
 	handle.Log(shared.LogLevelInfo, "ws-proxy: listening on %s", srv.Addr())
-	return &rawFilterFactory{stop: stop}, nil
+	return &rawFilterFactory{stop: func() {
+		group.Stop()
+		if actorObs != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			_ = actorObs.Shutdown(ctx)
+		}
+	}}, nil
 }
 
 func (f *rawConfigFactory) CreatePerRoute(_ []byte) (any, error) { return nil, nil }
@@ -121,6 +149,18 @@ type Config struct {
 
 	// ShutdownTimeout for graceful shutdown. Default: "5s".
 	ShutdownTimeout string `json:"shutdown_timeout"`
+
+	// ListenAddress is the loopback address for the embedded proxy server.
+	// Default: "127.0.0.1:0" (random free port).
+	ListenAddress string `json:"listen_addr"`
+
+	// OTELEndpoint enables actor-side OTLP/gRPC metrics export when set.
+	// Example: "127.0.0.1:4317".
+	OTELEndpoint string `json:"otel_endpoint"`
+
+	// OTELExportInterval controls actor-side metric export cadence.
+	// Default: "1s".
+	OTELExportInterval string `json:"otel_export_interval"`
 }
 
 func parseConfig(raw []byte) Config {
@@ -257,14 +297,7 @@ func (p *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	firstErr := <-errc
 
 	u := tap.Usage()
-	log.Info("ws-proxy: session ended",
-		"path", r.URL.Path,
-		"model", tap.Model(),
-		"input_tokens", u.InputTokens,
-		"output_tokens", u.OutputTokens,
-		"duration", time.Since(start).Round(time.Millisecond),
-		"reason", firstErr,
-	)
+	recordActorSession(ctx, log, r.URL.Path, tap.Model(), u.InputTokens, u.OutputTokens, time.Since(start), firstErr)
 }
 
 // --- sessionTap ---
