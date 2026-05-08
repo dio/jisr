@@ -12,14 +12,17 @@ make -C "$spa_dir" build
 
 (
 	cd "$spa_dir"
-	ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$spa_dir" "$envoy_bin" -c envoy.yaml --log-level warning
+	GODEBUG=cgocheck=0 ENVOY_DYNAMIC_MODULES_SEARCH_PATH="$spa_dir" "$envoy_bin" -c envoy.yaml --log-level warning
 ) &
 envoy_pid=$!
-trap 'kill "$envoy_pid"' EXIT
+trap 'kill "$envoy_pid" 2>/dev/null || true' EXIT
 
 ready=
 for _ in {1..50}; do
-	if curl -fsS "$admin_url/ready" >/dev/null; then
+	if ! kill -0 "$envoy_pid" 2>/dev/null; then
+		wait "$envoy_pid"
+	fi
+	if curl -fsS "$admin_url/ready" >/dev/null 2>&1; then
 		ready=1
 		break
 	fi
