@@ -119,11 +119,15 @@ func APIHandler(ctx context.Context, w jisr.ResponseWriter, r *jisr.Request) {
 	case path == "/api/time" || strings.HasPrefix(path, "/api/time?"):
 		serveTime(ctx, w, r)
 
-	default:
+	case strings.HasPrefix(path, "/api/"):
+		// Known /api/ prefix but no matching endpoint.
 		jsonResponse(w, http.StatusNotFound, map[string]string{
 			"error": "not found",
 			"path":  path,
 		})
+	default:
+		// Non-API path — pass through to the spa filter.
+		return
 	}
 }
 
